@@ -211,3 +211,50 @@ HM.SOURCES = [
   { label: "NDMA heat-wave do's and don'ts", url: "https://ndma.gov.in/Natural-Hazards/Heat-Wave/Dos-Donts" },
   { label: "WHO: UV index", url: "https://www.who.int/news-room/questions-and-answers/item/radiation-the-ultraviolet-(uv)-index" }
 ];
+
+/* ---------- Cooling simulator ----------
+ * Calibrated on published evidence:
+ *  - Urban forests average ~1.6 °C cooler than comparable built-up areas, and park
+ *    cooling reaches up to ~1.25 km beyond the boundary (Environmental Evidence
+ *    systematic review, 308 studies).
+ *  - Peak daytime pedestrian cooling from trees ≈ 3 °C in arid climates (global
+ *    meta-analysis, EGUsphere 2024) → used as the cap when patches overlap.
+ *  - Cool roofs (solar-reflective paint) cut indoor temperatures by ~2–5 °C in
+ *    pilots in Ahmedabad, Jodhpur, Bhopal and Surat; their effect on outdoor air
+ *    is small, so they do not change the outdoor map.
+ */
+HM.SIM = {
+  tree: { peak: 1.6, plateauKm: 0.4, sigmaKm: 0.85, cap: 3.0, nightFactor: 0.3 },
+  roof: { indoorLow: 2, indoorHigh: 5 },
+  maxFeatures: 80
+};
+
+HM.MITIGATION = {
+  city: [
+    { icon: "🌳", title: "Plant and protect tree cover in the hottest wards",
+      text: "Urban forests are on average about 1.6°C cooler than nearby built-up areas, and a park's cooling can reach up to 1.25 km beyond its edge. Start with the hotspots this map finds." },
+    { icon: "🏠", title: "Scale up cool roofs",
+      text: "Solar-reflective white paint on tin and concrete roofs lowered indoor temperatures by about 2–5°C in pilots in Ahmedabad, Jodhpur, Bhopal and Surat. It's cheap and needs no permits." },
+    { icon: "📣", title: "Run a Heat Action Plan",
+      text: "Early warnings, cooling centres, drinking-water points and changed working hours. Ahmedabad's plan, India's first in 2013, is estimated to have avoided about 2,380 heat-related deaths." },
+    { icon: "🚏", title: "Shade the places people wait and work",
+      text: "Bus stops, markets, traffic junctions and construction sites. A shaded pavement can feel several degrees cooler than a sunny one." },
+    { icon: "💧", title: "Restore lakes, wetlands and green roofs",
+      text: "Water bodies and wetlands cool their surroundings. Green roofs and walls lower surface temperatures by about 2°C." }
+  ],
+  home: [
+    "Paint the roof with solar-reflective white paint, or add an insulating false ceiling under tin sheets.",
+    "Shade windows from outside with awnings, bamboo chiks or plants; inside curtains trap more heat.",
+    "Plant a shade tree on the west and south sides of the house.",
+    "Ventilate at night and keep windows shut during the hottest hours."
+  ]
+};
+
+HM.SOURCES.push(
+  { label: "NASA POWER daily temperature data (heat history)", url: "https://power.larc.nasa.gov/" },
+  { label: "Systematic review: urban green space and temperature (Environmental Evidence)", url: "https://link.springer.com/10.1186/s13750-021-00226-y" },
+  { label: "Meta-analysis: cooling effects of urban trees across climates", url: "https://egusphere.copernicus.org/preprints/2024/egusphere-2024-234/" },
+  { label: "Cool roofs in Indian cities (MHT / NRDC pilots)", url: "https://thebetterindia.com/426457/white-roof-paint-ahmedabad-heat-relief" },
+  { label: "IIPH study of cool roofs in Ahmedabad slums", url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC7227734" },
+  { label: "Ahmedabad Heat Action Plan and cool roofs", url: "https://www.preventionweb.net/quick/20238" }
+);

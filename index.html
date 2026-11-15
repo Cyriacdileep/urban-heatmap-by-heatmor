@@ -44,6 +44,15 @@
         <span id="hourLabel" class="hour-label">Now</span>
       </div>
 
+      <div class="simbox">
+        <div class="simbar" id="simbar" hidden role="toolbar" aria-label="Cooling simulator">
+          <button type="button" class="tool" data-tool="tree" aria-pressed="false" title="Click the map to plant a patch of trees">🌳 <span>Plant trees</span></button>
+          <button type="button" class="tool" data-tool="roof" aria-pressed="false" title="Click the map to add cool (white) roofs">🏠 <span>Cool roofs</span></button>
+          <button type="button" class="tool ghost" id="simReset" title="Remove everything you placed">↺ <span>Reset</span></button>
+        </div>
+        <div class="sim-meter" id="simMeter" hidden aria-live="polite"></div>
+      </div>
+
       <div class="legend" id="legend"></div>
       <div class="status" id="status" role="status" aria-live="polite"></div>
     </section>

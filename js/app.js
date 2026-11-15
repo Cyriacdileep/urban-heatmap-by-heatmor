@@ -1,26 +1,32 @@
 /* UrbanHeat India — app logic
- * Live data: Open-Meteo forecast API (no key needed, CORS-enabled).
+ * Live data: Open-Meteo forecast API. Heat history: NASA POWER daily point API.
+ * Both are free, need no key and allow browser (CORS) requests.
  */
 (function () {
   "use strict";
 
   const API = "https://api.open-meteo.com/v1/forecast";
+  const POWER = "https://power.larc.nasa.gov/api/temporal/daily/point";
+  const HISTORY_START = "19900101";
   const CACHE_MS = 15 * 60 * 1000;
   const GRID_N = 9;            // 9 x 9 sample points around a city
   const GRID_HALF_DEG = 0.27;  // ~30 km either side of the centre
   const HOURS = 24;
+  const OV = 400;              // overlay canvas size in pixels (~0.15 km per pixel)
 
   const els = {
     city: document.getElementById("citySelect"),
     locate: document.getElementById("locateBtn"),
     panel: document.getElementById("panelBody"),
+    aside: document.getElementById("panel"),
     legend: document.getElementById("legend"),
     status: document.getElementById("status"),
     timebar: document.getElementById("timebar"),
     slider: document.getElementById("hourSlider"),
     hourLabel: document.getElementById("hourLabel"),
     play: document.getElementById("playBtn"),
-    readout: null
+    simbar: document.getElementById("simbar"),
+    simMeter: document.getElementById("simMeter")
   };
 
   const state = {
@@ -28,18 +34,25 @@
     layer: "apparent",    // "apparent" | "temp" | "uv"
     hour: 0,              // offset from the current hour, 0..23
     contrast: false,      // stretch colours to local min-max in city mode
-    india: null,          // array of Open-Meteo location objects, aligned with HM.CITIES
-    grid: null,           // { locs, lats, lons, bounds, city }
+    india: null,          // Open-Meteo location objects, aligned with HM.CITIES
+    grid: null,           // { locs, lats, lons, pts, bounds, city }
     focus: null,          // { loc, title, subtitle, terrain, lat, lon }
     playing: null,
-    reqId: 0
+    reqId: 0,
+    tool: null,           // null | "tree" | "roof"
+    features: [],         // planted trees / cool roofs: { type, lat, lon, grow, marker }
+    histTab: "year",      // "year" | "decades"
+    history: {}           // key -> { status, data, error }
   };
 
   /* ---------------- helpers ---------------- */
-  const $ = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstElementChild; };
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const fmt = (v, d = 0) => (v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(d));
   const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const MONTHS_LONG = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const dateText = (iso) => { const [y, m, d] = iso.split("-").map(Number); return `${d} ${MONTHS[m - 1]} ${y}`; };
 
   function heatLevel(apparent) {
     let lvl = HM.HEAT_LEVELS[0];
@@ -50,7 +63,7 @@
   function uvLevel(uv) {
     let lvl = HM.UV_LEVELS[0];
     if (uv == null) return lvl;
-    const u = Math.round(uv); // UV index is reported as a whole number
+    const u = Math.round(uv); // the UV index is reported as a whole number
     for (const l of HM.UV_LEVELS) if (u >= l.min) lvl = l;
     return lvl;
   }
@@ -69,7 +82,7 @@
       if (v <= st[i][0]) {
         const [a, ca] = st[i - 1], [b, cb] = st[i];
         const t = (v - a) / (b - a);
-        return [0, 1, 2].map((k) => Math.round(ca[k] + (cb[k] - ca[k]) * t));
+        return [Math.round(ca[0] + (cb[0] - ca[0]) * t), Math.round(ca[1] + (cb[1] - ca[1]) * t), Math.round(ca[2] + (cb[2] - ca[2]) * t)];
       }
     }
     return st[st.length - 1][1];
@@ -89,6 +102,25 @@
 
   /* ---------------- data access ---------------- */
   const cache = new Map();
+  async function getJSON(url, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    let res;
+    try {
+      res = await fetch(url, { signal: ctrl.signal });
+    } catch (e) {
+      throw new Error(e.name === "AbortError" ? "The weather service took too long to respond." : "Could not reach the weather service. Check your internet connection.");
+    } finally {
+      clearTimeout(timer);
+    }
+    if (res.status === 429) throw new Error("The weather service is rate-limiting requests. Please try again in a minute.");
+    if (!res.ok) {
+      let reason = "";
+      try { reason = (await res.json()).reason || ""; } catch (_) { /* ignore */ }
+      throw new Error(`Weather service error (${res.status}) ${reason}`.trim());
+    }
+    return res.json();
+  }
   function forecastUrl(points) {
     const p = new URLSearchParams({
       latitude: points.map((x) => x.lat.toFixed(4)).join(","),
@@ -105,23 +137,7 @@
     const url = forecastUrl(points);
     const hit = cache.get(url);
     if (hit && Date.now() - hit.t < CACHE_MS) return hit.data;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);
-    let res;
-    try {
-      res = await fetch(url, { signal: ctrl.signal });
-    } catch (e) {
-      throw new Error(e.name === "AbortError" ? "The weather service took too long to respond." : "Could not reach the weather service. Check your internet connection.");
-    } finally {
-      clearTimeout(timer);
-    }
-    if (res.status === 429) throw new Error("The weather service is rate-limiting requests. Please try again in a minute.");
-    if (!res.ok) {
-      let reason = "";
-      try { reason = (await res.json()).reason || ""; } catch (_) { /* ignore */ }
-      throw new Error(`Weather service error (${res.status}) ${reason}`.trim());
-    }
-    const json = await res.json();
+    const json = await getJSON(url);
     const data = Array.isArray(json) ? json : [json];
     data.forEach(prepLoc);
     cache.set(url, { t: Date.now(), data });
@@ -129,7 +145,7 @@
   }
   function prepLoc(loc) {
     const key = loc.current && loc.current.time ? loc.current.time.slice(0, 13) + ":00" : null;
-    let i = key ? loc.hourly.time.indexOf(key) : -1;
+    const i = key ? loc.hourly.time.indexOf(key) : -1;
     loc._start = i < 0 ? 0 : i;
   }
   function hourly(loc, name, h) {
@@ -148,22 +164,33 @@
     if (h === 0 && loc.current) return loc.current.relative_humidity_2m;
     return hourly(loc, "relative_humidity_2m", h);
   }
+  function isDayAt(loc, h) {
+    if (!loc) return true;
+    if (h === 0 && loc.current && loc.current.is_day != null) return loc.current.is_day === 1;
+    const t = timeAt(loc, h);
+    const hr = t ? istParts(t).h : 12;
+    return hr >= 6 && hr < 18;
+  }
   function timeAt(loc, h) {
     const t = loc && loc.hourly && loc.hourly.time[loc._start + h];
     return t ? new Date(t + ":00+05:30") : null;
   }
+  function istParts(d) {
+    const x = new Date(d.getTime() + (330 + d.getTimezoneOffset()) * 60000);
+    return { y: x.getFullYear(), m: x.getMonth(), d: x.getDate(), h: x.getHours() };
+  }
   function hourText(d, short) {
     if (!d) return "";
-    const now = new Date();
-    const ist = (x) => new Date(x.getTime() + (330 + x.getTimezoneOffset()) * 60000);
-    const a = ist(d), n = ist(now);
-    const sameDay = a.getDate() === n.getDate();
-    let hr = a.getHours();
-    const ampm = hr >= 12 ? "pm" : "am";
-    hr = hr % 12 || 12;
+    const a = istParts(d), n = istParts(new Date());
+    const hr = a.h % 12 || 12, ampm = a.h >= 12 ? "pm" : "am";
     const t = `${hr} ${ampm}`;
     if (short) return t;
-    return `${sameDay ? "Today" : "Tomorrow"} ${t}`;
+    return `${a.d === n.d ? "Today" : "Tomorrow"} ${t}`;
+  }
+  function istDateMinus(days) {
+    const n = istParts(new Date());
+    const d = new Date(Date.UTC(n.y, n.m, n.d) - days * 86400000);
+    return d.toISOString().slice(0, 10);
   }
 
   /* ---------------- status ---------------- */
@@ -182,11 +209,10 @@
   }
 
   /* ---------------- map ---------------- */
-  const map = L.map("map", { zoomControl: true, minZoom: 4, maxZoom: 14, worldCopyJump: false })
-    .setView([22.8, 80.5], 5);
-  /* Base map: OpenStreetMap tiles (no API key). The tile pane is muted with CSS so
-   * the heat colours stand out. If OSM tiles keep failing, switch to Esri's
-   * keyless light-grey basemap. */
+  const map = L.map("map", { zoomControl: true, minZoom: 4, maxZoom: 16 }).setView([22.8, 80.5], 5);
+
+  /* Base map: OpenStreetMap tiles (no API key), muted with CSS so heat colours stand
+   * out. If OSM tiles keep failing, switch to Esri's keyless light-grey basemap. */
   const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -207,14 +233,13 @@
   });
 
   const cityLayer = L.layerGroup().addTo(map);
+  const featureLayer = L.layerGroup().addTo(map);
   let overlay = null;
   let clickMarker = null;
 
   const readout = document.createElement("div");
   readout.className = "readout";
-  readout.style.cssText = "position:absolute;z-index:600;pointer-events:none;background:#1d1b18;color:#fff;font-size:12px;padding:4px 8px;border-radius:7px;display:none;white-space:nowrap;font-variant-numeric:tabular-nums";
   document.querySelector(".mapwrap").appendChild(readout);
-  els.readout = readout;
 
   function layerStops() { return state.layer === "uv" ? UV_STOPS : TEMP_STOPS; }
   function layerName() { return { apparent: "Feels like", temp: "Temperature", uv: "UV index" }[state.layer]; }
@@ -242,7 +267,7 @@
     });
   }
 
-  /* City heat grid */
+  /* ---------------- city heat grid ---------------- */
   function buildGrid(city) {
     const halfLon = GRID_HALF_DEG / Math.cos(city.lat * Math.PI / 180);
     const lats = [], lons = [], pts = [];
@@ -251,56 +276,140 @@
     for (let r = 0; r < GRID_N; r++) for (let c = 0; c < GRID_N; c++) pts.push({ lat: lats[r], lon: lons[c] });
     return { lats, lons, pts, bounds: L.latLngBounds([lats[GRID_N - 1], lons[0]], [lats[0], lons[GRID_N - 1]]) };
   }
-  function gridValues() {
-    const g = state.grid;
-    return g.locs.map((l) => valueAt(l, state.layer, state.hour));
-  }
+  function gridValues() { return state.grid.locs.map((l) => valueAt(l, state.layer, state.hour)); }
   function gridRange(vals) {
     const v = vals.filter((x) => x != null);
     return v.length ? [Math.min(...v), Math.max(...v)] : [0, 1];
   }
   function sampleGrid(vals, fy, fx) {
-    // fy, fx in grid units (0..N-1); bilinear with null fallback to nearest
     const N = GRID_N;
     const y0 = Math.max(0, Math.min(N - 1, Math.floor(fy))), x0 = Math.max(0, Math.min(N - 1, Math.floor(fx)));
     const y1 = Math.min(N - 1, y0 + 1), x1 = Math.min(N - 1, x0 + 1);
     const ty = fy - y0, tx = fx - x0;
-    const g = (r, c) => vals[r * N + c];
-    const a = g(y0, x0), b = g(y0, x1), c = g(y1, x0), d = g(y1, x1);
-    if ([a, b, c, d].some((x) => x == null)) return [a, b, c, d].find((x) => x != null) ?? null;
+    const a = vals[y0 * N + x0], b = vals[y0 * N + x1], c = vals[y1 * N + x0], d = vals[y1 * N + x1];
+    if (a == null || b == null || c == null || d == null) { const f = [a, b, c, d].find((x) => x != null); return f == null ? null : f; }
     return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
   }
-  function drawOverlay() {
-    if (overlay) { map.removeLayer(overlay); overlay = null; }
-    if (state.mode !== "city" || !state.grid) return;
+  const kmPerPx = () => (2 * GRID_HALF_DEG * 111.2) / (OV - 1);
+  function latLngToPx(lat, lon) {
+    const g = state.grid;
+    return [((lon - g.lons[0]) / (g.lons[GRID_N - 1] - g.lons[0])) * (OV - 1), ((g.lats[0] - lat) / (g.lats[0] - g.lats[GRID_N - 1])) * (OV - 1)];
+  }
+
+  /* base field cache: bilinear-interpolated values for the current hour + layer */
+  let base = null;
+  function getBase() {
+    const key = `${state.grid.city.lat},${state.grid.city.lon}|${state.hour}|${state.layer}`;
+    if (base && base.key === key) return base;
     const vals = gridValues();
+    const f = new Float32Array(OV * OV);
+    for (let y = 0; y < OV; y++) {
+      for (let x = 0; x < OV; x++) {
+        const v = sampleGrid(vals, (y / (OV - 1)) * (GRID_N - 1), (x / (OV - 1)) * (GRID_N - 1));
+        f[y * OV + x] = v == null ? NaN : v;
+      }
+    }
     const [lo, hi] = gridRange(vals);
-    const W = 240, H = 240;
-    const cv = document.createElement("canvas");
-    cv.width = W; cv.height = H;
-    const ctx = cv.getContext("2d");
-    const img = ctx.createImageData(W, H);
+    base = { key, f, lo, hi };
+    return base;
+  }
+
+  /* ---------------- cooling simulator ---------------- */
+  function treeCoolingAt(dKm, amp) {
+    const T = HM.SIM.tree;
+    if (dKm <= T.plateauKm) return amp;
+    const z = (dKm - T.plateauKm) / T.sigmaKm;
+    return amp * Math.exp(-z * z);
+  }
+  function simFactor() {
+    const centre = state.grid && state.grid.locs[Math.floor((GRID_N * GRID_N) / 2)];
+    return isDayAt(centre, state.hour) ? 1 : HM.SIM.tree.nightFactor;
+  }
+  /* returns cooling field (°C, positive = cooler) or null when nothing is planted */
+  function coolingField() {
+    const trees = state.features.filter((f) => f.type === "tree");
+    if (!trees.length || state.layer === "uv") return null;
+    const T = HM.SIM.tree, cap = T.cap, kpp = kmPerPx(), day = simFactor();
+    // combine overlapping patches with diminishing returns towards the cap:
+    // frac = 1 - Π(1 - c_i / cap)
+    const keep = new Float32Array(OV * OV).fill(1);
+    const reachKm = T.plateauKm + 2.6 * T.sigmaKm, rpx = Math.ceil(reachKm / kpp);
+    for (const t of trees) {
+      const amp = T.peak * t.grow * day;
+      if (amp <= 0) continue;
+      const [px, py] = latLngToPx(t.lat, t.lon);
+      const x0 = Math.max(0, Math.floor(px - rpx)), x1 = Math.min(OV - 1, Math.ceil(px + rpx));
+      const y0 = Math.max(0, Math.floor(py - rpx)), y1 = Math.min(OV - 1, Math.ceil(py + rpx));
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const d = Math.hypot(x - px, y - py) * kpp;
+          if (d > reachKm) continue;
+          keep[y * OV + x] *= 1 - treeCoolingAt(d, amp) / cap;
+        }
+      }
+    }
+    for (let i = 0; i < keep.length; i++) keep[i] = cap * (1 - keep[i]);
+    return keep;
+  }
+  function coolingAtLatLng(lat, lon) {
+    if (state.layer === "uv") return 0;
+    const T = HM.SIM.tree, day = simFactor();
+    let keep = 1;
+    for (const t of state.features) {
+      if (t.type !== "tree") continue;
+      const d = L.latLng(lat, lon).distanceTo([t.lat, t.lon]) / 1000;
+      keep *= 1 - treeCoolingAt(d, T.peak * t.grow * day) / T.cap;
+    }
+    return T.cap * (1 - keep);
+  }
+
+  /* ---------------- overlay drawing ---------------- */
+  const ovCanvas = document.createElement("canvas");
+  ovCanvas.width = OV; ovCanvas.height = OV;
+  const ovCtx = ovCanvas.getContext("2d");
+  let lastStats = null;
+
+  function drawOverlay() {
+    if (state.mode !== "city" || !state.grid) {
+      if (overlay) { map.removeLayer(overlay); overlay = null; }
+      return;
+    }
+    const b = getBase(), cool = coolingField();
     const stops = layerStops();
     const s0 = stops[0][0], s1 = stops[stops.length - 1][0];
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        let v = sampleGrid(vals, (y / (H - 1)) * (GRID_N - 1), (x / (W - 1)) * (GRID_N - 1));
-        const k = (y * W + x) * 4;
-        if (v == null) { img.data[k + 3] = 0; continue; }
-        if (state.contrast && hi - lo > 0.05) {
-          // map local range onto the warm half of the scale so hotspots pop
-          const t = (v - lo) / (hi - lo);
+    const img = ovCtx.createImageData(OV, OV), px = img.data;
+    const fade = 26;
+    let maxB = -Infinity, maxA = -Infinity, sumB = 0, sumA = 0, n = 0, cooledPx = 0, maxC = 0;
+    for (let y = 0; y < OV; y++) {
+      const ey = Math.min(y, OV - 1 - y) / fade;
+      for (let x = 0; x < OV; x++) {
+        const i = y * OV + x, k = i * 4;
+        const v0 = b.f[i];
+        if (Number.isNaN(v0)) { px[k + 3] = 0; continue; }
+        const c = cool ? cool[i] : 0;
+        let v = v0 - c;
+        if (v0 > maxB) maxB = v0;
+        if (v > maxA) maxA = v;
+        sumB += v0; sumA += v; n++;
+        if (c >= 0.3) cooledPx++;
+        if (c > maxC) maxC = c;
+        if (state.contrast && b.hi - b.lo > 0.05) {
+          const t = (v - b.lo) / (b.hi - b.lo);
           v = state.layer === "uv" ? s0 + t * (s1 - s0) * 0.8 : 27 + t * 24;
         }
         const col = colorAt(stops, v);
-        img.data[k] = col[0]; img.data[k + 1] = col[1]; img.data[k + 2] = col[2];
-        // soft edge fade
-        const ex = Math.min(x, W - 1 - x) / 18, ey = Math.min(y, H - 1 - y) / 18;
-        img.data[k + 3] = Math.round(255 * Math.min(1, ex, ey));
+        px[k] = col[0]; px[k + 1] = col[1]; px[k + 2] = col[2];
+        const ex = Math.min(x, OV - 1 - x) / fade;
+        px[k + 3] = Math.round(255 * Math.min(1, ex, ey));
       }
     }
-    ctx.putImageData(img, 0, 0);
-    overlay = L.imageOverlay(cv.toDataURL(), state.grid.bounds, { opacity: 0.62, interactive: false }).addTo(map);
+    ovCtx.putImageData(img, 0, 0);
+    const url = ovCanvas.toDataURL();
+    if (overlay) overlay.setUrl(url);
+    else overlay = L.imageOverlay(url, state.grid.bounds, { opacity: 0.62, interactive: false }).addTo(map);
+    const kpp = kmPerPx();
+    lastStats = n ? { maxB, maxA, maxC, meanB: sumB / n, meanA: sumA / n, cooledKm2: cooledPx * kpp * kpp } : null;
+    updateSimMeter();
   }
 
   function gridValueAtLatLng(ll) {
@@ -308,14 +417,16 @@
     if (!g || !g.bounds.contains(ll)) return null;
     const fy = ((g.lats[0] - ll.lat) / (g.lats[0] - g.lats[GRID_N - 1])) * (GRID_N - 1);
     const fx = ((ll.lng - g.lons[0]) / (g.lons[GRID_N - 1] - g.lons[0])) * (GRID_N - 1);
-    return sampleGrid(gridValues(), fy, fx);
+    const v = sampleGrid(gridValues(), fy, fx);
+    return v == null ? null : v - coolingAtLatLng(ll.lat, ll.lng);
   }
 
   map.on("mousemove", (e) => {
     if (state.mode !== "city" || !state.grid) { readout.style.display = "none"; return; }
     const v = gridValueAtLatLng(e.latlng);
     if (v == null) { readout.style.display = "none"; return; }
-    readout.textContent = `${layerName()}: ${fmt(v, state.layer === "uv" ? 1 : 1)}${layerUnit()} · click for details`;
+    const hint = state.tool === "tree" ? "click to plant trees" : state.tool === "roof" ? "click to add cool roofs" : "click for details";
+    readout.textContent = `${layerName()}: ${fmt(v, 1)}${layerUnit()} · ${hint}`;
     readout.style.left = e.containerPoint.x + 14 + "px";
     readout.style.top = e.containerPoint.y + 12 + "px";
     readout.style.display = "block";
@@ -324,8 +435,117 @@
 
   map.on("click", (e) => {
     if (state.mode !== "city") return;
+    if (state.tool) return addFeature(state.tool, e.latlng.lat, e.latlng.lng);
     inspectPoint(e.latlng.lat, e.latlng.lng, "Selected spot", null);
   });
+
+  /* ---------------- planting ---------------- */
+  const TREE_SVG = `<svg viewBox="0 0 40 48" width="34" height="41" aria-hidden="true"><ellipse cx="20" cy="45" rx="11" ry="2.5" fill="rgba(0,0,0,.25)"/><rect x="17.5" y="30" width="5" height="14" rx="1.5" fill="#7a4b26"/><circle cx="20" cy="18" r="13" fill="#2f9e44"/><circle cx="12" cy="24" r="8.5" fill="#37b24d"/><circle cx="28" cy="24" r="8.5" fill="#2b8a3e"/><circle cx="20" cy="12" r="8" fill="#51cf66"/><circle cx="15" cy="13" r="2.5" fill="#8ce99a" opacity=".8"/></svg>`;
+  const ROOF_SVG = `<svg viewBox="0 0 44 40" width="34" height="31" aria-hidden="true"><ellipse cx="22" cy="37" rx="15" ry="2.5" fill="rgba(0,0,0,.2)"/><rect x="9" y="18" width="26" height="17" rx="1.5" fill="#f1c27d" stroke="#8d6e63" stroke-width="1.2"/><path d="M4 20 L22 5 L40 20 Z" fill="#ffffff" stroke="#74c0fc" stroke-width="2.4" stroke-linejoin="round"/><rect x="19" y="25" width="6" height="10" fill="#8d6e63"/><path d="M30 2 l2 3 M36 6 l-3 2 M24 1 l0 3" stroke="#fab005" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+
+  let animRaf = null;
+  function animateGrowth() {
+    if (animRaf) return;
+    const step = () => {
+      let pending = false;
+      const now = performance.now();
+      state.features.forEach((f) => {
+        if (f.grow < 1) {
+          f.grow = reduceMotion ? 1 : Math.min(1, (now - f.t0) / 1400);
+          if (f.grow < 1) pending = true;
+        }
+      });
+      drawOverlay();
+      animRaf = pending ? requestAnimationFrame(step) : null;
+      if (!pending) refreshAfterSim();
+    };
+    animRaf = requestAnimationFrame(step);
+  }
+  function addFeature(type, lat, lon) {
+    if (state.features.length >= HM.SIM.maxFeatures) return status(`That's the limit of ${HM.SIM.maxFeatures} items. Press Reset to start again.`, "error");
+    const icon = L.divIcon({ className: "", html: `<div class="plant ${type}">${type === "tree" ? TREE_SVG : ROOF_SVG}</div>`, iconSize: [34, 41], iconAnchor: [17, type === "tree" ? 39 : 28] });
+    const marker = L.marker([lat, lon], { icon, interactive: false, keyboard: false }).addTo(featureLayer);
+    state.features.push({ type, lat, lon, grow: type === "tree" ? 0 : 1, t0: performance.now(), marker });
+    // Tree cooling (1–3 °C) is small next to the full 10–54 °C colour scale, so stretch
+    // colours to this area's range the first time trees are planted.
+    if (type === "tree" && !state.contrast && !state.autoContrastDone) {
+      state.contrast = true;
+      state.autoContrastDone = true;
+      drawLegend();
+    }
+    if (type === "tree" && state.layer !== "uv") animateGrowth();
+    else { updateSimMeter(); refreshAfterSim(); }
+  }
+  function resetFeatures() {
+    featureLayer.clearLayers();
+    state.features = [];
+    drawOverlay();
+    updateSimMeter();
+    refreshAfterSim();
+  }
+  function setTool(tool) {
+    state.tool = state.tool === tool ? null : tool;
+    els.simbar.querySelectorAll("[data-tool]").forEach((b) => {
+      const on = b.dataset.tool === state.tool;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    document.getElementById("map").classList.toggle("planting", !!state.tool);
+    updateSimMeter();
+  }
+  function plantAtHotspots() {
+    if (!state.grid) return;
+    if (state.layer === "uv") setLayer("apparent");
+    const narrow = window.innerWidth <= 900;
+    if (narrow) document.querySelector(".mapwrap").scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth" });
+    const wait = narrow ? 600 : 0;
+    hotspots().hot.forEach((h, k) => setTimeout(() => addFeature("tree", h.lat, h.lon), wait + k * 350));
+  }
+  function updateSimMeter() {
+    const m = els.simMeter;
+    if (state.mode !== "city") { m.hidden = true; return; }
+    const trees = state.features.filter((f) => f.type === "tree").length;
+    const roofs = state.features.filter((f) => f.type === "roof").length;
+    if (!trees && !roofs) {
+      m.hidden = !state.tool;
+      m.innerHTML = state.tool === "tree"
+        ? "<strong>Plant trees:</strong> click the map to add a small urban forest and watch the heat map cool around it."
+        : "<strong>Cool roofs:</strong> click the map to paint a block of roofs with solar-reflective white paint.";
+      return;
+    }
+    m.hidden = false;
+    let html = "";
+    if (trees) {
+      if (state.layer === "uv") {
+        html += `<div><strong>🌳 ${trees} tree patch${trees > 1 ? "es" : ""}.</strong> Trees don't change the UV index itself, but their shade cuts the UV that reaches people beneath them. Switch to “Feels like” to see the cooling.</div>`;
+      } else if (lastStats) {
+        const where = simHotspotChange();
+        html += `<div><strong>🌳 ${trees} tree patch${trees > 1 ? "es" : ""}</strong> · up to <b>−${fmt(lastStats.maxC, 1)}°C</b> where you planted · ~${fmt(lastStats.cooledKm2)} km² cooled by 0.3°C or more${where}</div>`;
+        if (simFactor() < 1) html += `<div class="note">It's night at this hour: trees cool much less after dark and dense canopy can even trap heat.</div>`;
+      }
+    }
+    if (roofs) {
+      html += `<div><strong>🏠 ${roofs} cool-roof block${roofs > 1 ? "s" : ""}.</strong> Homes under reflective roofs can be ${HM.SIM.roof.indoorLow}–${HM.SIM.roof.indoorHigh}°C cooler indoors. The outdoor map barely changes, so roofs aren't drawn as cooling.</div>`;
+    }
+    if (trees && state.contrast && state.layer !== "uv") html += `<div class="note">Colours are stretched to this area's range so the cooling shows up. Untick “Highlight local hotspots” to see the absolute scale.</div>`;
+    html += `<div class="note">Estimate based on published studies, not a measurement. See “About this data”.</div>`;
+    m.innerHTML = html;
+  }
+  function simHotspotChange() {
+    if (!state.grid) return "";
+    const h = hotspots().hot[0];
+    if (!h) return "";
+    const c = coolingAtLatLng(h.lat, h.lon);
+    if (c < 0.05) return "";
+    const v = valueAt(state.grid.locs[h.i], state.layer, state.hour);
+    return ` · Hotspot 1: ${fmt(v, 1)} → <b>${fmt(v - c, 1)}°C</b>`;
+  }
+  let refreshTimer = null;
+  function refreshAfterSim() {
+    // re-render the panel's simulator summary without rebuilding everything on every frame
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => { if (state.mode === "city" && state.focus) renderPointPanel(); }, 120);
+  }
 
   /* ---------------- legend ---------------- */
   function drawLegend() {
@@ -338,76 +558,153 @@
         const nx = HM.UV_LEVELS[i + 1];
         return `<span><i style="background:${l.color}"></i>${nx ? `${l.min}–${nx.min - 1}` : `${l.min}+`} ${l.label}</span>`;
       }).join("");
+    } else if (state.layer === "temp") {
+      zones = `<span class="note">Zones are set by the “feels like” temperature.</span>`;
     } else {
       zones = HM.HEAT_LEVELS.map((l, i) => {
         const nx = HM.HEAT_LEVELS[i + 1];
         const rng = i === 0 ? `&lt;${nx.min}°` : nx ? `${l.min}–${nx.min}°` : `${l.min}°+`;
         return `<span><i style="background:${l.color}"></i>${rng} ${l.label}</span>`;
       }).join("");
-      if (state.layer === "temp") zones = `<span class="note">Zones are set by the “feels like” temperature.</span>`;
     }
-    let contrast = "";
+    let extra = "";
     if (state.mode === "city") {
-      contrast = `<label style="display:flex;gap:6px;align-items:center;margin-top:8px;cursor:pointer"><input type="checkbox" id="contrastChk" ${state.contrast ? "checked" : ""}> Highlight local hotspots</label>`;
+      extra = `<label class="chk"><input type="checkbox" id="contrastChk" ${state.contrast ? "checked" : ""}> Highlight local hotspots</label>`;
       if (state.grid) {
         const [lo, hi] = gridRange(gridValues());
-        contrast += `<div class="note" style="margin-top:4px">Across this area: ${fmt(lo, 1)}–${fmt(hi, 1)}${layerUnit()}</div>`;
+        extra += `<div class="note" style="margin-top:4px">Across this area: ${fmt(lo, 1)}–${fmt(hi, 1)}${layerUnit()}</div>`;
       }
     }
     els.legend.innerHTML = `<h4>${layerName()}${layerUnit() ? " (°C)" : ""}</h4>
       <div class="bar" style="background:linear-gradient(90deg,${grad})"></div>
       <div class="ticks"><span>${s0}</span><span>${Math.round((s0 + s1) / 2)}</span><span>${s1}${state.layer === "uv" ? "+" : ""}</span></div>
       ${state.mode === "city" && state.contrast ? `<div class="note" style="margin-top:4px">Colours stretched to this area's range.</div>` : ""}
-      <div class="zones">${zones}</div>${contrast}`;
+      <div class="zones">${zones}</div>${extra}`;
     const chk = document.getElementById("contrastChk");
     if (chk) chk.onchange = () => { state.contrast = chk.checked; drawOverlay(); drawLegend(); };
   }
 
+  /* ---------------- sky theme for the side panel ---------------- */
+  const SKY = {
+    night: { g: ["#0b1430", "#22325f"], sun: null },
+    mild: { g: ["#7cc8f8", "#e3f4ff"], sun: ["#ffe066", "#ffd43b"], cloud: "#ffffff" },
+    warm: { g: ["#ffcf6e", "#fff1d2"], sun: ["#ffd43b", "#fab005"], cloud: "#fffaf0" },
+    hot: { g: ["#ff8f3c", "#ffdcb4"], sun: ["#ffc078", "#f76707"], cloud: "#fff4e6" },
+    scorch: { g: ["#d9381e", "#ffab6b"], sun: ["#ffa94d", "#e8590c"], cloud: "#ffe8cc" }
+  };
+  function skyKey(apparent, day) {
+    if (!day) return "night";
+    const id = heatLevel(apparent).id;
+    return { comfortable: "mild", caution: "warm", "extreme-caution": "hot", danger: "scorch", "extreme-danger": "scorch" }[id];
+  }
+  const svgUrl = (s) => `url("data:image/svg+xml,${encodeURIComponent(s)}")`;
+  function sunSvg(cx, cy, r, c, rays) {
+    let s = "";
+    if (rays) for (let a = 0; a < 360; a += 30) {
+      const rad = a * Math.PI / 180;
+      s += `<line x1="${cx + Math.cos(rad) * (r + 5)}" y1="${cy + Math.sin(rad) * (r + 5)}" x2="${cx + Math.cos(rad) * (r + 13)}" y2="${cy + Math.sin(rad) * (r + 13)}" stroke="${c[1]}" stroke-width="3" stroke-linecap="round" opacity=".75"/>`;
+    }
+    return s + `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${c[0]}" stroke="${c[1]}" stroke-width="2"/>`;
+  }
+  function cloudSvg(x, y, s, fill, op) {
+    return `<g transform="translate(${x} ${y}) scale(${s})" opacity="${op}"><ellipse cx="0" cy="10" rx="34" ry="12" fill="${fill}"/><circle cx="-14" cy="2" r="13" fill="${fill}"/><circle cx="8" cy="-4" r="17" fill="${fill}"/><circle cx="26" cy="6" r="10" fill="${fill}"/></g>`;
+  }
+  function skyPattern(key) {
+    const t = SKY[key];
+    let inner = "";
+    if (key === "night") {
+      const stars = [[30, 40], [120, 90], [260, 30], [330, 140], [70, 200], [200, 250], [300, 330], [40, 380], [150, 430], [280, 480], [100, 520], [340, 560]];
+      inner = stars.map(([x, y], i) => `<circle cx="${x}" cy="${y}" r="${i % 3 ? 1.3 : 2}" fill="#fff" opacity="${i % 2 ? .55 : .85}"/>`).join("") +
+        `<circle cx="300" cy="260" r="16" fill="#f1f3f5" opacity=".55"/><circle cx="307" cy="254" r="14" fill="#22325f" opacity=".55"/>` +
+        cloudSvg(90, 470, 0.8, "#3b4a7a", .5);
+    } else {
+      inner = sunSvg(320, 70, 16, t.sun, true) + sunSvg(60, 330, 11, t.sun, true) + sunSvg(250, 520, 9, t.sun, false) +
+        cloudSvg(110, 140, 0.9, t.cloud, .8) + cloudSvg(270, 290, 0.7, t.cloud, .7) + cloudSvg(150, 450, 0.6, t.cloud, .65) + cloudSvg(330, 600, 0.5, t.cloud, .6);
+    }
+    return svgUrl(`<svg xmlns="http://www.w3.org/2000/svg" width="380" height="640" viewBox="0 0 380 640">${inner}</svg>`);
+  }
+  function heroArt(key) {
+    const t = SKY[key];
+    if (key === "night") {
+      return `<svg class="hero-art" viewBox="0 0 140 110" aria-hidden="true"><circle class="twinkle" cx="20" cy="20" r="2" fill="#fff"/><circle class="twinkle d2" cx="120" cy="14" r="1.6" fill="#fff"/><circle class="twinkle d3" cx="60" cy="90" r="1.4" fill="#fff"/>
+        <circle cx="86" cy="50" r="30" fill="#f8f9fa"/><circle cx="100" cy="40" r="27" fill="${t.g[0]}"/><g class="drift">${cloudSvg(40, 78, .7, "#3b4a7a", .9)}</g></svg>`;
+    }
+    const big = key === "scorch" || key === "hot";
+    const r = big ? 30 : 24;
+    let rays = "";
+    for (let a = 0; a < 360; a += big ? 20 : 30) rays += `<rect x="-2.5" y="${-(r + 22)}" width="5" height="${big ? 15 : 11}" rx="2.5" fill="${t.sun[1]}" transform="rotate(${a})"/>`;
+    return `<svg class="hero-art" viewBox="0 0 140 110" aria-hidden="true"><g transform="translate(88 50)"><g class="spin">${rays}</g>
+      <circle r="${r + 6}" fill="${t.sun[0]}" opacity=".35"/><circle r="${r}" fill="${t.sun[0]}" stroke="${t.sun[1]}" stroke-width="3"/></g>
+      ${key === "mild" ? `<g class="drift">${cloudSvg(40, 80, .8, "#fff", .95)}</g>` : `<g class="drift">${cloudSvg(36, 86, .55, t.cloud, .8)}</g>`}</svg>`;
+  }
+  let currentSky = null;
+  function applySky(key) {
+    currentSky = key;
+    const t = SKY[key];
+    const a = els.aside;
+    a.dataset.sky = key;
+    a.style.setProperty("--sky-top", t.g[0]);
+    a.style.setProperty("--sky-bottom", t.g[1]);
+    a.style.setProperty("--sky-pattern", skyPattern(key));
+  }
+
   /* ---------------- panel ---------------- */
-  let chart = null;
-  function destroyChart() { if (chart) { chart.destroy(); chart = null; } }
+  let charts = [];
+  function destroyCharts() { charts.forEach((c) => c.destroy()); charts = []; }
 
   function panelLoading(title) {
-    destroyChart();
-    els.panel.innerHTML = `<p class="eyebrow">Loading live data</p><h2 class="place">${esc(title)}</h2>
-      <div class="skeleton" style="height:90px"></div><div class="skeleton"></div><div class="skeleton" style="width:70%"></div><div class="skeleton" style="height:160px"></div>`;
+    destroyCharts();
+    els.panel.innerHTML = `<div class="hero"><div class="hero-text"><p class="eyebrow">Loading live data</p><h2 class="place">${esc(title)}</h2></div></div>
+      <section class="card"><div class="skeleton" style="height:90px"></div><div class="skeleton"></div><div class="skeleton" style="width:70%"></div></section>
+      <section class="card"><div class="skeleton" style="height:160px"></div></section>`;
+  }
+  function hero(eyebrow, title, sub) {
+    return `<div class="hero"><div class="hero-text"><p class="eyebrow">${eyebrow}</p><h2 class="place">${esc(title)}</h2>${sub ? `<p class="sub">${sub}</p>` : ""}</div>${heroArt(currentSky || "mild")}</div>`;
   }
 
   function renderIndiaPanel() {
-    destroyChart();
+    destroyCharts();
     if (!state.india) return;
     const h = state.hour;
     const t = timeAt(state.india[0], h);
-    const rows = HM.CITIES.map((c, i) => ({ c, loc: state.india[i], v: valueAt(state.india[i], state.layer, h), uv: valueAt(state.india[i], "uv", h), app: valueAt(state.india[i], "apparent", h) }))
-      .sort((a, b) => (b.v ?? -99) - (a.v ?? -99));
+    const rows = HM.CITIES.map((c, i) => ({ c, v: valueAt(state.india[i], state.layer, h), uv: valueAt(state.india[i], "uv", h), app: valueAt(state.india[i], "apparent", h) }))
+      .sort((a, b) => (b.v == null ? -99 : b.v) - (a.v == null ? -99 : a.v));
+    const apps = rows.map((r) => r.app).filter((x) => x != null).sort((a, b) => a - b);
+    applySky(skyKey(apps[Math.floor(apps.length / 2)], isDayAt(state.india[0], h)));
     const counts = {};
     rows.forEach((r) => { const l = heatLevel(r.app); counts[l.id] = (counts[l.id] || 0) + 1; });
     const summary = HM.HEAT_LEVELS.filter((l) => counts[l.id]).map((l) =>
-      `<span style="display:inline-flex;align-items:center;gap:5px;margin:0 10px 4px 0;font-size:13px"><i style="width:10px;height:10px;border-radius:3px;background:${l.color};display:inline-block"></i>${counts[l.id]} ${l.label.toLowerCase()}</span>`).join("");
+      `<span class="pill"><i style="background:${l.color}"></i>${counts[l.id]} ${l.label.toLowerCase()}</span>`).join("");
 
     els.panel.innerHTML = `
-      <p class="eyebrow">${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}</p>
-      <h2 class="place">All of India</h2>
-      <p class="sub">${HM.CITIES.length} cities · sorted by ${layerName().toLowerCase()} · tap a city to see its heat map</p>
-      <div style="margin-bottom:10px">${summary}</div>
-      <ul class="rank" id="rankList">
-        ${rows.map((r) => {
-          const col = r.v == null ? [160, 160, 160] : colorAt(layerStops(), r.v);
-          return `<li data-city="${esc(r.c.name)}" tabindex="0" role="button" aria-label="Open ${esc(r.c.name)}">
-            <span class="dot" style="background:${rgbStr(col)}"></span>
-            <span class="nm">${esc(r.c.name)} <span class="note">${esc(r.c.state)}</span></span>
-            <span class="val">${fmt(r.v, state.layer === "uv" ? 1 : 0)}${layerUnit()}</span>
-            <span class="uvv">${state.layer === "uv" ? fmt(r.app, 0) + "°C" : "UV " + fmt(r.uv, 0)}</span>
-          </li>`;
+      ${hero(`${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}`, "All of India", `${HM.CITIES.length} cities · sorted by ${layerName().toLowerCase()} · tap a city to see its heat map`)}
+      <section class="card">
+        <div class="pills">${summary}</div>
+        <ul class="rank" id="rankList">
+          ${rows.map((r) => {
+            const col = r.v == null ? [160, 160, 160] : colorAt(layerStops(), r.v);
+            return `<li data-city="${esc(r.c.name)}" tabindex="0" role="button" aria-label="Open ${esc(r.c.name)}">
+              <span class="dot" style="background:${rgbStr(col)}"></span>
+              <span class="nm">${esc(r.c.name)} <span class="note">${esc(r.c.state)}</span></span>
+              <span class="val">${fmt(r.v, state.layer === "uv" ? 1 : 0)}${layerUnit()}</span>
+              <span class="uvv">${state.layer === "uv" ? fmt(r.app, 0) + "°C" : "UV " + fmt(r.uv, 0)}</span>
+            </li>`;
+          }).join("")}
+        </ul>
+      </section>
+      <section class="card">
+        <h3 class="sec">What the heat zones mean</h3>
+        ${HM.HEAT_LEVELS.map((l, i) => {
+          const nx = HM.HEAT_LEVELS[i + 1];
+          const rng = i === 0 ? `below ${nx.min}°C` : nx ? `${l.min}–${nx.min}°C` : `${l.min}°C and above`;
+          return `<details class="acc"><summary><span><i class="sw" style="background:${l.color}"></i>${l.label} <span class="note">feels like ${rng}</span></span></summary>
+            <p class="who">${esc(l.summary)}</p><ul class="tips">${l.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>`;
         }).join("")}
-      </ul>
-      <h3 class="sec">What the heat zones mean</h3>
-      ${HM.HEAT_LEVELS.map((l, i) => {
-        const nx = HM.HEAT_LEVELS[i + 1];
-        const rng = i === 0 ? `below ${nx.min}°C` : nx ? `${l.min}–${nx.min}°C` : `${l.min}°C and above`;
-        return `<details class="acc"><summary><span><i style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${l.color};margin-right:6px"></i>${l.label} <span class="note">feels like ${rng}</span></span></summary>
-          <p class="who">${esc(l.summary)}</p><ul class="tips">${l.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>`;
-      }).join("")}
+      </section>
+      <section class="card">
+        <h3 class="sec">See the history and test fixes</h3>
+        <p class="note" style="margin:0">Open any city to see when it was hottest since 1990, then plant trees and add cool roofs on its map to see how much they could cool it.</p>
+      </section>
       ${emergencyBlock()}
       ${aboutBlock()}`;
     els.panel.querySelectorAll("#rankList li").forEach((li) => {
@@ -440,69 +737,75 @@
     const temp = valueAt(loc, "temp", h), app = valueAt(loc, "apparent", h), uv = valueAt(loc, "uv", h), rh = rhAt(loc, h);
     const lvl = heatLevel(app);
     const uvPeak = loc.daily && loc.daily.uv_index_max ? loc.daily.uv_index_max[0] : null;
-    // UV precautions follow the higher of the selected hour and the rest of today's peak
-    const uvForAdvice = Math.max(uv ?? 0, uvPeak ?? 0);
-    const uvl = uvLevel(uv), uvlAdvice = uvLevel(uvForAdvice);
+    const uvForAdvice = Math.max(uv == null ? 0 : uv, uvPeak == null ? 0 : uvPeak);
+    const uvl = uvLevel(uv), uvlAdvice = uvLevel(uvForAdvice), uvlPeak = uvLevel(uvPeak);
     const tw = wetBulb(temp, rh);
-    const isNight = h === 0 && loc.current && loc.current.is_day === 0;
+    const day = isDayAt(loc, h);
     const wx = h === 0 && loc.current ? WEATHER[loc.current.weather_code] : null;
+    applySky(skyKey(app, day));
 
-    // cumulative heat actions: this level first, then the basics from lower levels
     const idx = HM.HEAT_LEVELS.indexOf(lvl);
     const basics = [];
     for (let i = idx - 1; i >= 1; i--) HM.HEAT_LEVELS[i].actions.forEach((a) => basics.push(a));
+    const simCool = state.features.some((x) => x.type === "tree") && state.layer !== "uv" ? coolingAtLatLng(f.lat, f.lon) : 0;
 
-    destroyChart();
+    destroyCharts();
     els.panel.innerHTML = `
-      <p class="eyebrow">${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}${wx ? " · " + esc(wx) : ""}</p>
-      <h2 class="place">${esc(f.title)}</h2>
-      <p class="sub">${esc(f.subtitle || "")}</p>
+      ${hero(`${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}${wx ? " · " + esc(wx) : ""}`, f.title, esc(f.subtitle || ""))}
 
-      <div class="zone-card" style="background:${lvl.color};color:${lvl.ink}">
-        <div class="zlabel">Heat zone</div>
-        <div class="zname">${esc(lvl.label)}</div>
-        <p>${esc(lvl.summary)}</p>
-      </div>
+      <section class="card">
+        <div class="zone-card" style="background:${lvl.color};color:${lvl.ink}">
+          <div class="zlabel">Heat zone</div>
+          <div class="zname">${esc(lvl.label)}</div>
+          <p>${esc(lvl.summary)}</p>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="k">Temperature</div><div class="v">${fmt(temp, 1)}<small>°C</small></div></div>
+          <div class="stat"><div class="k">Feels like</div><div class="v">${fmt(app, 1)}<small>°C</small></div>${simCool >= 0.05 ? `<span class="uv-chip sim">🌳 −${fmt(simCool, 1)}°C with trees</span>` : ""}</div>
+          <div class="stat"><div class="k">Humidity</div><div class="v">${fmt(rh)}<small>%</small></div></div>
+          <div class="stat"><div class="k">UV index</div><div class="v">${fmt(uv, 1)}</div><span class="uv-chip" style="background:${uvl.color};color:${uvl.ink}">${esc(uvl.label)}</span></div>
+          <div class="stat"><div class="k">Today's peak UV</div><div class="v">${fmt(uvPeak, 1)}</div><span class="uv-chip" style="background:${uvlPeak.color};color:${uvlPeak.ink}">${esc(uvlPeak.label)}</span></div>
+          <div class="stat" title="Wet-bulb temperature combines heat and humidity. Above about 31°C, even fit people struggle to cool down during activity."><div class="k">Wet-bulb (approx.)</div><div class="v">${fmt(tw, 1)}<small>°C</small></div></div>
+        </div>
+        ${!day && h === 0 ? `<p class="note" style="margin:-4px 0 10px">The sun is down, so the UV index is 0 now. Sun-safety advice below is for today's peak.</p>` : ""}
+        ${imdBlock(loc, f.terrain)}
+      </section>
 
-      <div class="stats">
-        <div class="stat"><div class="k">Temperature</div><div class="v">${fmt(temp, 1)}<small>°C</small></div></div>
-        <div class="stat"><div class="k">Feels like</div><div class="v">${fmt(app, 1)}<small>°C</small></div></div>
-        <div class="stat"><div class="k">Humidity</div><div class="v">${fmt(rh)}<small>%</small></div></div>
-        <div class="stat"><div class="k">UV index</div><div class="v">${fmt(uv, 1)}</div><span class="uv-chip" style="background:${uvl.color};color:${uvl.ink}">${esc(uvl.label)}</span></div>
-        <div class="stat"><div class="k">Today's peak UV</div><div class="v">${fmt(uvPeak, 1)}</div><span class="uv-chip" style="background:${uvLevel(uvPeak).color};color:${uvLevel(uvPeak).ink}">${esc(uvLevel(uvPeak).label)}</span></div>
-        <div class="stat" title="Wet-bulb temperature combines heat and humidity. Above about 31°C, even fit people struggle to cool down during activity."><div class="k">Wet-bulb (approx.)</div><div class="v">${fmt(tw, 1)}<small>°C</small></div></div>
-      </div>
-      ${isNight ? `<p class="note" style="margin-top:-6px">The sun is down, so the UV index is 0 now. Sun-safety advice below is for today's peak.</p>` : ""}
+      <section class="card">
+        <h3 class="sec">Next 24 hours</h3>
+        <div class="chart-box"><canvas id="hourChart" aria-label="Hourly temperature, feels-like and UV forecast"></canvas></div>
+      </section>
 
-      ${imdBlock(loc, f.terrain)}
+      ${historyCard()}
 
-      <h3 class="sec">Next 24 hours</h3>
-      <div class="chart-box"><canvas id="hourChart" aria-label="Hourly temperature, feels-like and UV forecast"></canvas></div>
+      <section class="card">
+        <h3 class="sec">What to do in this zone</h3>
+        <ul class="tips">${lvl.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>
+        ${basics.length ? `<details class="acc" style="margin-top:8px"><summary>Keep following the basics</summary><ul class="tips">${basics.map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>` : ""}
+        <h3 class="sec">Sun safety · UV ${esc(uvlAdvice.label.toLowerCase())}${uvPeak != null ? ` (peak ${fmt(uvPeak, 0)} today)` : ""}</h3>
+        <ul class="tips">${uvlAdvice.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>
+      </section>
 
-      <h3 class="sec">What to do in this zone</h3>
-      <ul class="tips">${lvl.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>
-      ${basics.length ? `<details class="acc" style="margin-top:8px"><summary>Keep following the basics</summary><ul class="tips">${basics.map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>` : ""}
+      ${state.mode === "city" && state.grid ? hotspotBlock() + fixItCard() : ""}
 
-      <h3 class="sec">Sun safety · UV ${esc(uvlAdvice.label.toLowerCase())}${uvPeak != null ? ` (peak ${fmt(uvPeak, 0)} today)` : ""}</h3>
-      <ul class="tips">${uvlAdvice.actions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>
+      <section class="card">
+        <h3 class="sec">If you are at higher risk</h3>
+        ${HM.GROUPS.map((g) => `<details class="acc"><summary>${esc(g.title)}</summary><p class="who">${esc(g.who)}</p><ul class="tips">${g.tips.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details>`).join("")}
+        <details class="acc" ${lvl.min >= 41 ? "open" : ""}><summary>Heatstroke: signs and first aid</summary>
+          <p class="who">Warning signs</p><ul class="tips">${HM.HEATSTROKE.signs.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+          <p class="who">What to do</p><ul class="tips">${HM.HEATSTROKE.firstAid.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+        </details>
+      </section>
 
-      <h3 class="sec">If you are at higher risk</h3>
-      ${HM.GROUPS.map((g) => `<details class="acc"><summary>${esc(g.title)}</summary><p class="who">${esc(g.who)}</p><ul class="tips">${g.tips.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details>`).join("")}
-
-      <details class="acc" ${lvl.min >= 41 ? "open" : ""}><summary>Heatstroke: signs and first aid</summary>
-        <p class="who">Warning signs</p><ul class="tips">${HM.HEATSTROKE.signs.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
-        <p class="who">What to do</p><ul class="tips">${HM.HEATSTROKE.firstAid.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
-      </details>
-
-      ${state.mode === "city" && state.grid ? hotspotBlock() : ""}
       ${emergencyBlock()}
       ${aboutBlock()}`;
 
-    drawChart(loc);
-    bindHotspots();
+    drawHourChart(loc);
+    drawHistoryChart();
+    bindPanel();
   }
 
-  function drawChart(loc) {
+  function drawHourChart(loc) {
     const cv = document.getElementById("hourChart");
     if (!cv || typeof Chart === "undefined") return;
     const labels = [], tt = [], aa = [], uu = [];
@@ -513,7 +816,7 @@
       uu.push(valueAt(loc, "uv", h));
     }
     const sel = state.hour;
-    chart = new Chart(cv, {
+    charts.push(new Chart(cv, {
       data: {
         labels,
         datasets: [
@@ -536,9 +839,140 @@
         },
         onClick: (_, el) => { if (el && el.length) setHour(el[0].index); }
       }
-    });
+    }));
   }
 
+  /* ---------------- heat history (timeline) ---------------- */
+  function historyPlace() {
+    const c = state.grid ? state.grid.city : null;
+    return c ? { key: `${c.lat.toFixed(3)},${c.lon.toFixed(3)}`, name: c.name === "Your area" ? "your area" : c.name, lat: c.lat, lon: c.lon } : null;
+  }
+  async function loadHistory(place) {
+    const rec = state.history[place.key];
+    if (rec && (rec.status === "loading" || rec.status === "ready")) return;
+    state.history[place.key] = { status: "loading" };
+    const p = new URLSearchParams({
+      parameters: "T2M_MAX", community: "AG",
+      latitude: place.lat.toFixed(4), longitude: place.lon.toFixed(4),
+      start: HISTORY_START, end: istDateMinus(1).replace(/-/g, ""), format: "JSON"
+    });
+    try {
+      const j = await getJSON(`${POWER}?${p}`, 45000);
+      const fill = (j.header && j.header.fill_value) != null ? j.header.fill_value : -999;
+      const raw = j.properties && j.properties.parameter && j.properties.parameter.T2M_MAX;
+      if (!raw) throw new Error("NASA POWER returned no temperature data.");
+      const days = Object.keys(raw).sort().filter((k) => raw[k] != null && raw[k] > fill + 1)
+        .map((k) => ({ t: `${k.slice(0, 4)}-${k.slice(4, 6)}-${k.slice(6, 8)}`, v: raw[k] }));
+      if (days.length < 400) throw new Error("Not enough history for this spot.");
+      state.history[place.key] = { status: "ready", data: summariseHistory(days) };
+    } catch (e) {
+      state.history[place.key] = { status: "error", error: e.message };
+    }
+    const cur = historyPlace();
+    if (state.mode === "city" && cur && cur.key === place.key) renderPointPanel();
+  }
+  function summariseHistory(days) {
+    const last365 = days.slice(-365);
+    const hotYear = last365.reduce((m, x) => (x.v > m.v ? x : m), last365[0]);
+    const years = {};
+    const monthSum = new Array(12).fill(0), monthN = new Array(12).fill(0);
+    days.forEach((x) => {
+      const y = +x.t.slice(0, 4), m = +x.t.slice(5, 7) - 1;
+      if (!years[y]) years[y] = { y, v: x.v, t: x.t, n: 0 };
+      if (x.v > years[y].v) { years[y].v = x.v; years[y].t = x.t; }
+      years[y].n++;
+      monthSum[m] += x.v; monthN[m]++;
+    });
+    const yearList = Object.values(years).sort((a, b) => a.y - b.y);
+    const lastYear = yearList[yearList.length - 1];
+    const top = days.slice().sort((a, b) => b.v - a.v).slice(0, 5);
+    const monthMeans = monthSum.map((s, i) => s / (monthN[i] || 1));
+    const hottestMonth = monthMeans.indexOf(Math.max(...monthMeans));
+    return { last365, hotYear, yearList, partialYear: lastYear && lastYear.n < 360 ? lastYear.y : null, top, hottestMonth, first: days[0].t, lastDay: days[days.length - 1].t };
+  }
+  function historyCard() {
+    const place = historyPlace();
+    if (!place) return "";
+    const rec = state.history[place.key];
+    if (!rec || rec.status === "loading") {
+      if (!rec) setTimeout(() => loadHistory(place), 0);
+      return `<section class="card"><h3 class="sec">When was ${esc(place.name)} hottest?</h3><p class="note">Loading daily records since 1990 from NASA…</p><div class="skeleton" style="height:150px"></div></section>`;
+    }
+    if (rec.status === "error") {
+      return `<section class="card"><h3 class="sec">When was ${esc(place.name)} hottest?</h3><p class="note">Couldn't load the history: ${esc(rec.error)}</p><button class="btn small" id="histRetry" type="button">Retry</button></section>`;
+    }
+    const H = rec.data;
+    const rec1 = H.top[0];
+    const hill = state.grid && state.grid.city.terrain === "hilly";
+    return `<section class="card">
+      <h3 class="sec">When was ${esc(place.name)} hottest?</h3>
+      <div class="tabs" role="tablist">
+        <button type="button" data-tab="year" class="${state.histTab === "year" ? "on" : ""}" role="tab">Past 12 months</button>
+        <button type="button" data-tab="decades" class="${state.histTab === "decades" ? "on" : ""}" role="tab">Since 1990</button>
+      </div>
+      ${state.histTab === "year"
+        ? `<p class="hist-lead">Hottest day in the past year: <b>${fmt(H.hotYear.v, 1)}°C</b> on ${dateText(H.hotYear.t)}.</p>`
+        : `<p class="hist-lead">Hottest day since 1990: <b>${fmt(rec1.v, 1)}°C</b> on ${dateText(rec1.t)}. Each bar is the hottest day of that year.</p>`}
+      <div class="chart-box tall"><canvas id="histChart" aria-label="Heat history chart"></canvas></div>
+      ${state.histTab === "decades" ? `<p class="note" style="margin:10px 0 0;font-weight:600">5 hottest days since 1990</p><ol class="toplist">${H.top.map((x) => `<li><span>${dateText(x.t)}</span><b>${fmt(x.v, 1)}°C</b></li>`).join("")}</ol>` : ""}
+      <p class="note">Usually hottest in <b>${MONTHS_LONG[H.hottestMonth]}</b>. Daily maximum air temperature from <a href="https://power.larc.nasa.gov/" target="_blank" rel="noopener">NASA POWER</a> (satellite and model data on a roughly 50 km grid), ${dateText(H.first)} to ${dateText(H.lastDay)}. It describes the wider city area, so individual weather stations can record higher or lower peaks.${hill ? " <b>Hill city:</b> the coarse grid mixes in lower, hotter valleys, so these values run higher than the town itself." : ""}</p>
+    </section>`;
+  }
+  function drawHistoryChart() {
+    const cv = document.getElementById("histChart");
+    const place = historyPlace();
+    if (!cv || !place || typeof Chart === "undefined") return;
+    const rec = state.history[place.key];
+    if (!rec || rec.status !== "ready") return;
+    const H = rec.data;
+    if (state.histTab === "year") {
+      const hotIdx = H.last365.indexOf(H.hotYear);
+      charts.push(new Chart(cv, {
+        type: "line",
+        data: {
+          labels: H.last365.map((x) => x.t),
+          datasets: [{
+            label: "Daily maximum °C", data: H.last365.map((x) => x.v), borderWidth: 1.5, tension: 0.3,
+            borderColor: "#f08c00", backgroundColor: "rgba(240,140,0,.12)", fill: true,
+            segment: { borderColor: (c) => rgbStr(colorAt(TEMP_STOPS, c.p1.parsed.y)) },
+            pointRadius: (c) => (c.dataIndex === hotIdx ? 5 : 0), pointBackgroundColor: "#d9282f", pointBorderColor: "#fff", pointBorderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: { legend: { display: false }, tooltip: { callbacks: { title: (it) => dateText(it[0].label), label: (c) => `Max ${Number(c.raw).toFixed(1)}°C` } } },
+          scales: {
+            x: { ticks: { font: { size: 10 }, maxTicksLimit: 7, callback: function (v) { const t = this.getLabelForValue(v); return MONTHS[+t.slice(5, 7) - 1] + " " + t.slice(2, 4); } }, grid: { display: false } },
+            y: { ticks: { font: { size: 10 } }, title: { display: true, text: "°C", font: { size: 10 } } }
+          }
+        }
+      }));
+    } else {
+      const ys = H.yearList;
+      charts.push(new Chart(cv, {
+        data: {
+          labels: ys.map((y) => String(y.y)),
+          datasets: [
+            { type: "bar", label: "Hottest day of the year °C", data: ys.map((y) => y.v), backgroundColor: ys.map((y) => { const c = colorAt(TEMP_STOPS, y.v); return y.y === H.partialYear ? `rgba(${c[0]},${c[1]},${c[2]},.45)` : rgbStr(c); }), borderRadius: 2, order: 2 }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: { label: (c) => `${Number(c.raw).toFixed(1)}°C on ${dateText(ys[c.dataIndex].t)}${ys[c.dataIndex].y === H.partialYear ? " (year so far)" : ""}` } }
+          },
+          scales: {
+            x: { ticks: { font: { size: 10 }, maxTicksLimit: 9 }, grid: { display: false } },
+            y: { beginAtZero: false, min: Math.floor(Math.min(...ys.map((y) => y.v)) - 2), max: Math.ceil(Math.max(...ys.map((y) => y.v)) + 1), ticks: { font: { size: 10 } }, title: { display: true, text: "°C", font: { size: 10 } } }
+          }
+        }
+      }));
+    }
+  }
+
+  /* ---------------- hotspots + fix-it ---------------- */
   function offsetText(lat, lon, c) {
     const R = 6371, toR = Math.PI / 180;
     const dy = (lat - c.lat) * toR * R, dx = (lon - c.lon) * toR * R * Math.cos(c.lat * toR);
@@ -548,21 +982,46 @@
     const dirs = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
     return `~${Math.round(dist)} km ${dirs[Math.round(ang / 45) % 8]} of centre`;
   }
-  function hotspotBlock() {
+  function hotspots() {
     const g = state.grid;
     const vals = g.locs.map((l, i) => ({ i, v: valueAt(l, "apparent", state.hour), lat: g.pts[i].lat, lon: g.pts[i].lon }))
       .filter((x) => x.v != null).sort((a, b) => b.v - a.v);
-    if (!vals.length) return "";
-    const hot = vals.slice(0, 3), cool = vals[vals.length - 1];
-    const row = (x, tag) => {
-      const l = heatLevel(x.v);
-      return `<li data-lat="${x.lat}" data-lon="${x.lon}" tabindex="0" role="button"><span class="dot" style="background:${l.color}"></span><span class="nm">${tag} <span class="note">${offsetText(x.lat, x.lon, g.city)}</span></span><span class="val">${fmt(x.v, 1)}°C</span></li>`;
-    };
-    return `<h3 class="sec">Hotspots around ${esc(g.city.name)}</h3>
-      <ul class="rank" id="hotList">${hot.map((x, k) => row(x, `Hotspot ${k + 1}`)).join("")}${row(cool, "Coolest area")}</ul>
-      <p class="note">Feels-like temperature across ${GRID_N * GRID_N} forecast points covering about 60 × 60 km. Tap a row to inspect it.</p>`;
+    return { hot: vals.slice(0, 3), cool: vals[vals.length - 1] };
   }
-  function bindHotspots() {
+  function hotspotBlock() {
+    const g = state.grid;
+    const { hot, cool } = hotspots();
+    if (!hot.length) return "";
+    const row = (x, tag) => {
+      const c = coolingAtLatLng(x.lat, x.lon);
+      const v = x.v - (state.layer === "uv" ? 0 : c);
+      const l = heatLevel(v);
+      return `<li data-lat="${x.lat}" data-lon="${x.lon}" tabindex="0" role="button"><span class="dot" style="background:${l.color}"></span><span class="nm">${tag} <span class="note">${offsetText(x.lat, x.lon, g.city)}</span></span><span class="val">${fmt(v, 1)}°C${c >= 0.05 && state.layer !== "uv" ? ` <span class="note">(−${fmt(c, 1)})</span>` : ""}</span></li>`;
+    };
+    return `<section class="card"><h3 class="sec">Hotspots around ${esc(g.city.name)}</h3>
+      <ul class="rank" id="hotList">${hot.map((x, k) => row(x, `Hotspot ${k + 1}`)).join("")}${row(cool, "Coolest area")}</ul>
+      <p class="note">Feels-like temperature across ${GRID_N * GRID_N} forecast points covering about 60 × 60 km. Tap a row to inspect it.</p></section>`;
+  }
+  function fixItCard() {
+    const g = state.grid;
+    const { hot } = hotspots();
+    const where = hot.length ? offsetText(hot[0].lat, hot[0].lon, g.city) : "";
+    const trees = state.features.filter((f) => f.type === "tree").length, roofs = state.features.filter((f) => f.type === "roof").length;
+    return `<section class="card fixit">
+      <h3 class="sec">How to cool ${esc(g.city.name === "Your area" ? "this area" : g.city.name)}</h3>
+      ${hot.length ? `<p class="hist-lead">Start with <b>Hotspot 1</b> (${where}). It runs ${fmt(hot[0].v - hotspots().cool.v, 1)}°C hotter than the coolest part of this area right now.</p>` : ""}
+      <div class="sim-cta">
+        <button type="button" class="btn primary" id="plantHot">🌳 Plant trees at the 3 hotspots</button>
+        <button type="button" class="btn" data-tool-btn="tree">Plant trees yourself</button>
+        <button type="button" class="btn" data-tool-btn="roof">Add cool roofs</button>
+      </div>
+      ${trees || roofs ? `<p class="note">You've placed ${trees} tree patch${trees === 1 ? "" : "es"} and ${roofs} cool-roof block${roofs === 1 ? "" : "s"}. Watch the map: cooler colours spread out from each tree patch.</p>` : ""}
+      <ul class="fix">${HM.MITIGATION.city.map((m) => `<li><span class="fi" aria-hidden="true">${m.icon}</span><div><b>${esc(m.title)}</b><br><span>${esc(m.text)}</span></div></li>`).join("")}</ul>
+      <details class="acc"><summary>What you can do at home</summary><ul class="tips">${HM.MITIGATION.home.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details>
+    </section>`;
+  }
+
+  function bindPanel() {
     els.panel.querySelectorAll("#hotList li").forEach((li) => {
       const go = () => {
         const lat = +li.dataset.lat, lon = +li.dataset.lon;
@@ -572,17 +1031,28 @@
       li.addEventListener("click", go);
       li.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
     });
+    els.panel.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => { state.histTab = b.dataset.tab; renderPointPanel(); }));
+    const retry = document.getElementById("histRetry");
+    if (retry) retry.onclick = () => { const p = historyPlace(); delete state.history[p.key]; renderPointPanel(); };
+    const ph = document.getElementById("plantHot");
+    if (ph) ph.onclick = plantAtHotspots;
+    els.panel.querySelectorAll("[data-tool-btn]").forEach((b) => b.addEventListener("click", () => {
+      if (state.tool !== b.dataset.toolBtn) setTool(b.dataset.toolBtn);
+      if (window.innerWidth <= 900) document.querySelector(".mapwrap").scrollIntoView({ behavior: "smooth" });
+    }));
   }
 
   function emergencyBlock() {
     return `<div class="emergency">Heat emergency? Call <strong>108</strong> for an ambulance, or <strong>112</strong>.</div>`;
   }
   function aboutBlock() {
-    return `<details class="acc" style="margin-top:14px"><summary>About this data</summary>
+    return `<section class="card"><details class="acc flat"><summary>About this data</summary>
       <p class="note">Live readings and forecasts come from the free Open-Meteo API, which blends national weather-service models (resolution about 2–11 km). The map shows how heat varies across a city at that scale. Street-level differences, such as a concrete market versus a park, need satellite surface-temperature data and are not shown.
-      Zones use the “feels like” temperature, which combines air temperature, humidity and wind, with the standard heat-index bands. UV categories follow the WHO Global Solar UV Index. Precautions are adapted from India's NDMA heatwave guidance.
-      Data refreshes every 15 minutes. This site does not issue official warnings.</p>
-      <ul class="tips">${HM.SOURCES.map((s) => `<li><a href="${s.url}" target="_blank" rel="noopener">${esc(s.label)}</a></li>`).join("")}</ul></details>`;
+      Heat history uses NASA POWER daily maximum temperatures since 1990 (satellite and model data, roughly 50 km grid).
+      Zones use the “feels like” temperature, which combines air temperature, humidity and wind, with the standard heat-index bands. UV categories follow the WHO Global Solar UV Index. Precautions are adapted from India's NDMA heatwave guidance.</p>
+      <p class="note"><b>Tree simulator:</b> each tree patch stands for a small urban forest. It cools by up to ${HM.SIM.tree.peak}°C at its centre (urban forests average about 1.6°C cooler than built-up surroundings), fading to almost nothing by about 1.25 km away, the distance park cooling has been measured to reach. Overlapping patches add up with diminishing returns, capped at ${HM.SIM.tree.cap}°C, the peak daytime cooling trees achieve in hot, dry climates. At night the effect is cut to ${Math.round(HM.SIM.tree.nightFactor * 100)}%. Cool roofs lower indoor temperatures by about 2–5°C but barely change outdoor air, so they don't alter the map. These are estimates for exploring ideas, not predictions for a specific site.</p>
+      <p class="note">Data refreshes every 15 minutes. This site does not issue official warnings.</p>
+      <ul class="tips">${HM.SOURCES.map((s) => `<li><a href="${s.url}" target="_blank" rel="noopener">${esc(s.label)}</a></li>`).join("")}</ul></details></section>`;
   }
 
   function renderPanel() {
@@ -599,8 +1069,7 @@
   async function loadIndiaOnce() {
     status("Loading live data for " + HM.CITIES.length + " cities…");
     try {
-      const data = await fetchForecast(HM.CITIES);
-      state.india = data;
+      state.india = await fetchForecast(HM.CITIES);
       els.timebar.hidden = false;
       drawCityMarkers();
       if (state.mode === "india") renderIndiaPanel();
@@ -608,15 +1077,25 @@
     } catch (e) {
       state.india = null;
       status(e.message, "error", loadIndia);
-      if (state.mode === "india") els.panel.innerHTML = `<h2 class="place">Couldn't load live data</h2><p class="sub">${esc(e.message)}</p>${emergencyBlock()}`;
+      if (state.mode === "india") els.panel.innerHTML = `${hero("Something went wrong", "Couldn't load live data", esc(e.message))}${emergencyBlock()}`;
     }
+  }
+
+  function leaveCity() {
+    state.grid = null;
+    state.focus = null;
+    base = null;
+    featureLayer.clearLayers();
+    state.features = [];
+    if (state.tool) setTool(state.tool);
+    if (clickMarker) { map.removeLayer(clickMarker); clickMarker = null; }
   }
 
   function goIndia(push = true) {
     state.mode = "india";
-    state.grid = null;
-    state.focus = null;
-    if (clickMarker) { map.removeLayer(clickMarker); clickMarker = null; }
+    leaveCity();
+    els.simbar.hidden = true;
+    els.simMeter.hidden = true;
     els.city.value = "";
     drawOverlay();
     drawLegend();
@@ -629,14 +1108,16 @@
     if (!city) return goIndia(push);
     state.mode = "city";
     state.contrast = false;
+    state.autoContrastDone = false;
+    leaveCity();
     els.city.value = city.name;
     if (push) setHash("city-" + slug(city.name));
-    if (clickMarker) { map.removeLayer(clickMarker); clickMarker = null; }
     const g = buildGrid(city);
     g.city = city;
     map.flyToBounds(g.bounds, { duration: 0.8, padding: [10, 10] });
     panelLoading(city.name);
     if (!state.india) loadIndia(); else drawCityMarkers();
+    drawOverlay();
     drawLegend();
     const id = ++state.reqId;
     status(`Loading heat map for ${city.name}…`);
@@ -646,6 +1127,7 @@
       g.locs = locs;
       state.grid = g;
       els.timebar.hidden = false;
+      els.simbar.hidden = false;
       const centre = locs[Math.floor((GRID_N * GRID_N) / 2)];
       state.focus = { loc: centre, title: city.name, subtitle: `${city.state} · city centre · tap anywhere on the map to check another spot`, terrain: city.terrain, lat: city.lat, lon: city.lon };
       drawOverlay();
@@ -655,7 +1137,7 @@
     } catch (e) {
       if (id !== state.reqId) return;
       status(e.message, "error", () => goCity(city, false));
-      els.panel.innerHTML = `<h2 class="place">${esc(city.name)}</h2><p class="sub">Couldn't load live data: ${esc(e.message)}</p>${emergencyBlock()}`;
+      els.panel.innerHTML = `${hero("Something went wrong", city.name, "Couldn't load live data: " + esc(e.message))}${emergencyBlock()}`;
     }
   }
 
@@ -669,21 +1151,21 @@
     if (clickMarker) map.removeLayer(clickMarker);
     clickMarker = L.marker([lat, lon], { icon: L.divIcon({ className: "", html: '<div class="click-dot"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }), interactive: false }).addTo(map);
     const near = nearestCity(lat, lon);
-    const base = state.grid ? state.grid.city : near;
+    const baseCity = state.grid ? state.grid.city : near;
     panelLoading(title);
     const id = ++state.reqId;
     try {
       const [loc] = await fetchForecast([{ lat, lon }]);
       if (id !== state.reqId) return;
       state.focus = {
-        loc, title, lat, lon, terrain: base.terrain,
-        subtitle: subtitle || `${offsetText(lat, lon, base)} ${base.name} · ${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`
+        loc, title, lat, lon, terrain: baseCity.terrain,
+        subtitle: subtitle || `${offsetText(lat, lon, baseCity)} ${baseCity.name} · ${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`
       };
       renderPointPanel();
     } catch (e) {
       if (id !== state.reqId) return;
       status(e.message, "error", () => inspectPoint(lat, lon, title, subtitle));
-      els.panel.innerHTML = `<h2 class="place">${esc(title)}</h2><p class="sub">Couldn't load live data: ${esc(e.message)}</p>${emergencyBlock()}`;
+      els.panel.innerHTML = `${hero("Something went wrong", title, "Couldn't load live data: " + esc(e.message))}${emergencyBlock()}`;
     }
   }
 
@@ -708,7 +1190,7 @@
     drawCityMarkers();
     drawOverlay();
     drawLegend();
-    if (state.mode === "india") renderIndiaPanel();
+    renderPanel();
   }
 
   /* hash routing: #city-delhi */
@@ -735,12 +1217,15 @@
     c ? goCity(c) : goIndia();
   });
   document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => setLayer(b.dataset.layer)));
+  els.simbar.querySelectorAll("[data-tool]").forEach((b) => b.addEventListener("click", () => setTool(b.dataset.tool)));
+  document.getElementById("simReset").addEventListener("click", resetFeatures);
   els.slider.addEventListener("input", () => setHour(+els.slider.value));
   els.play.addEventListener("click", () => {
     if (state.playing) { clearInterval(state.playing); state.playing = null; els.play.textContent = "▶"; return; }
     els.play.textContent = "❚❚";
     state.playing = setInterval(() => setHour((state.hour + 1) % HOURS), 900);
   });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.tool) setTool(state.tool); });
   els.locate.addEventListener("click", () => {
     if (!navigator.geolocation) return status("Your browser can't share its location.", "error");
     status("Finding your location…");
@@ -761,13 +1246,22 @@
   });
   window.addEventListener("hashchange", routeFromHash);
 
-  // refresh live data every 15 minutes
-  setInterval(() => {
+  // refresh live data every 15 minutes (planted trees are kept)
+  setInterval(async () => {
     cache.clear();
-    state.india = null;
-    loadIndia().then(() => { if (state.mode === "city" && state.grid) goCity(state.grid.city, false); });
+    await loadIndia();
+    if (state.mode === "city" && state.grid) {
+      try {
+        const locs = await fetchForecast(state.grid.pts);
+        state.grid.locs = locs;
+        base = null;
+        if (state.focus && state.focus.title === state.grid.city.name) state.focus.loc = locs[Math.floor((GRID_N * GRID_N) / 2)];
+        drawOverlay(); drawLegend(); renderPointPanel();
+      } catch (_) { /* keep showing the last data */ }
+    }
   }, CACHE_MS);
 
+  applySky("mild");
   drawLegend();
   routeFromHash();
 })();
