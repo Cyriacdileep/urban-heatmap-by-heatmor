@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UrbanHeat India — live heat &amp; UV map for Indian cities</title>
+  <meta name="description" content="Live heat-stress and UV index map for Indian cities, with safety precautions for each heat zone.">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <h1>UrbanHeat India</h1>
+        <p class="tag">Live heat &amp; UV map for Indian cities</p>
+      </div>
+    </div>
+    <div class="controls">
+      <label class="sr-only" for="citySelect">Choose a city</label>
+      <select id="citySelect">
+        <option value="">All of India</option>
+      </select>
+      <button id="locateBtn" class="btn ghost" type="button" title="Use my location" aria-label="Use my location">◎<span class="btn-text"> My location</span></button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="mapwrap" aria-label="Map">
+      <div id="map"></div>
+
+      <div class="map-toolbar">
+        <div class="seg" role="tablist" aria-label="Map layer">
+          <button type="button" data-layer="apparent" class="on" role="tab">Feels like</button>
+          <button type="button" data-layer="temp" role="tab">Temperature</button>
+          <button type="button" data-layer="uv" role="tab">UV index</button>
+        </div>
+      </div>
+
+      <div class="timebar" id="timebar" hidden>
+        <button type="button" id="playBtn" class="btn small" aria-label="Play forecast">▶</button>
+        <input type="range" id="hourSlider" min="0" max="23" value="0" aria-label="Forecast hour">
+        <span id="hourLabel" class="hour-label">Now</span>
+      </div>
+
+      <div class="legend" id="legend"></div>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <aside class="panel" id="panel" aria-label="Details">
+      <div id="panelBody"></div>
+    </aside>
+  </main>
+
+  <footer class="foot">
+    <p>
+      Data: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0) ·
+      Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors, © <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> ·
+      Guidance from NDMA &amp; WHO.
+      This is not an official warning — follow <a href="https://mausam.imd.gov.in/" target="_blank" rel="noopener">IMD</a> and your local authority.
+      Emergency: <strong>108</strong> (ambulance) · <strong>112</strong>
+    </p>
+  </footer>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="js/data.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
