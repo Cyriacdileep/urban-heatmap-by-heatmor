@@ -44,12 +44,13 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .mapwrap { position: relative; min-height: 420px; }
 #map { position: absolute; inset: 0; background: #e9e6df; }
 /* mute the colourful OSM base map so heat colours read clearly */
-#map .leaflet-tile-pane { filter: grayscale(0.85) contrast(0.9) brightness(1.04); }
+#map .osm-tiles { filter: grayscale(0.85) contrast(0.9) brightness(1.04); }
+.lst-tiles img { image-rendering: pixelated; image-rendering: crisp-edges; }
 .panel { background: var(--card); border-left: 1px solid var(--line); overflow-y: auto; max-height: calc(100vh - 110px); }
 #panelBody { padding: 16px 18px 28px; }
 
 /* map overlays */
-.map-toolbar { position: absolute; top: 12px; left: 56px; z-index: 500; }
+.map-toolbar { position: absolute; top: 12px; left: 56px; z-index: 500; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 290px); }
 .seg { display: inline-flex; background: #fff; border-radius: 12px; box-shadow: var(--shadow); padding: 3px; }
 .seg button { font: inherit; font-size: 13.5px; border: 0; background: none; padding: 7px 12px; border-radius: 9px; cursor: pointer; color: var(--muted); }
 .seg button.on { background: var(--ink); color: #fff; }
@@ -254,4 +255,45 @@ ul.fix span { color: #4a463f; }
   .legend .chk { margin-top: 6px; font-size: 11px; }
   .sim-meter { font-size: 12px; padding: 7px 10px; }
   .sim-meter .note { display: none; }
+}
+
+/* ---------- v3: satellite ---------- */
+.seg.basemap button.on { background: #1971c2; }
+.mini-seg { display: inline-flex; background: #f1efe9; border-radius: 9px; padding: 2px; margin: 6px 6px 0 0; }
+.mini-seg button { font: inherit; font-size: 11.5px; border: 0; background: none; padding: 4px 8px; border-radius: 7px; cursor: pointer; color: var(--muted); }
+.mini-seg button.on { background: #fff; color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.mini-seg.inline { margin: 0 0 8px; flex-wrap: wrap; }
+.legend .chk.op { justify-content: space-between; font-size: 11.5px; color: var(--muted); }
+.legend .chk.op input { width: 96px; accent-color: #1971c2; }
+.stat.wide { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr auto; align-items: baseline; column-gap: 8px; }
+.stat.wide .note { grid-column: 1 / -1; font-size: 11.5px; }
+.satcard { border: 2px solid #a5d8ff; }
+.cmp { display: grid; gap: 8px; margin: 6px 0 12px; }
+.cmp-row { display: grid; grid-template-columns: 1fr; gap: 3px; font-size: 13px; position: relative; }
+.cmp-row b { position: absolute; right: 0; top: 0; font-variant-numeric: tabular-nums; }
+.cmp-bar { display: block; height: 10px; border-radius: 5px; }
+.cmp-bar.g { background: linear-gradient(90deg, #8ce99a, #2b8a3e); }
+.cmp-bar.b { background: linear-gradient(90deg, #ffc078, #d9480f); }
+.cmp-bar.w { background: linear-gradient(90deg, #a5d8ff, #1971c2); }
+ul.spots { list-style: none; padding: 0; margin: 0 0 12px; font-size: 13.5px; }
+ul.spots li { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
+ul.spots li.cool b { color: #1971c2; } ul.spots li.hot b { color: #c92a2a; }
+.satcard .btn.primary { background: #1971c2; border-color: #1971c2; width: 100%; margin-bottom: 8px; }
+@media (max-width: 900px) {
+  .map-toolbar { left: 12px; right: 12px; max-width: none; }
+  .leaflet-top.leaflet-left { top: 96px; }
+  .seg button { padding: 6px 9px; font-size: 12.5px; }
+}
+@media (max-width: 900px) {
+  .legend { top: 104px; bottom: auto; }
+  .status { top: 104px; }
+}
+@media (max-width: 900px) {
+  .seg { max-width: 100%; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .seg::-webkit-scrollbar { display: none; }
+  .seg button { white-space: nowrap; flex: none; }
+  .status { left: 54px; transform: none; max-width: calc(100% - 230px); font-size: 12px; }
+}
+@media (max-width: 420px) {
+  .seg button { padding: 6px 8px; font-size: 12px; }
 }

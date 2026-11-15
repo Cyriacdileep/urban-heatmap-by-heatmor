@@ -35,6 +35,11 @@
           <button type="button" data-layer="apparent" class="on" role="tab">Feels like</button>
           <button type="button" data-layer="temp" role="tab">Temperature</button>
           <button type="button" data-layer="uv" role="tab">UV index</button>
+          <button type="button" data-layer="lst" role="tab" title="Ground temperature measured by NASA satellites">🛰 Surface heat</button>
+        </div>
+        <div class="seg basemap" role="group" aria-label="Base map">
+          <button type="button" data-basemap="map" class="on" aria-pressed="true">Map</button>
+          <button type="button" data-basemap="sat" aria-pressed="false">Satellite</button>
         </div>
       </div>
 
@@ -66,6 +71,7 @@
     <p>
       Data: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (CC BY 4.0) ·
       Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors ·
+      Satellite: <a href="https://s2maps.eu" target="_blank" rel="noopener">Sentinel-2 cloudless</a> by EOX, surface temperature &amp; vegetation from <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener">NASA GIBS</a>, history from <a href="https://power.larc.nasa.gov/" target="_blank" rel="noopener">NASA POWER</a> ·
       Guidance from NDMA &amp; WHO.
       This is not an official warning — follow <a href="https://mausam.imd.gov.in/" target="_blank" rel="noopener">IMD</a> and your local authority.
       Emergency: <strong>108</strong> (ambulance) · <strong>112</strong>
@@ -75,6 +81,7 @@
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/chart.umd.min.js"></script>
   <script src="js/data.js"></script>
+  <script src="js/satellite.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

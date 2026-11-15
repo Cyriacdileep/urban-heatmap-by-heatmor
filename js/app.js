@@ -42,7 +42,9 @@
     tool: null,           // null | "tree" | "roof"
     features: [],         // planted trees / cool roofs: { type, lat, lon, grow, marker }
     histTab: "year",      // "year" | "decades"
-    history: {}           // key -> { status, data, error }
+    history: {},          // key -> { status, data, error }
+    basemap: "map",       // "map" | "sat"
+    sat: { kind: "day", period: "latest", dates: {}, opacity: 0.7, cityVals: {}, analyses: {} }
   };
 
   /* ---------------- helpers ---------------- */
@@ -214,9 +216,27 @@
   /* Base map: OpenStreetMap tiles (no API key), muted with CSS so heat colours stand
    * out. If OSM tiles keep failing, switch to Esri's keyless light-grey basemap. */
   const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
+    maxZoom: 19, className: "osm-tiles",
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map);
+  /* Satellite photos: Sentinel-2 cloudless 2023 mosaic by EOX (10 m, keyless, non-commercial
+   * licence CC BY-NC-SA 4.0). Falls back to Esri World Imagery if EOX tiles fail. */
+  let satBase = L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg", {
+    maxZoom: 19, maxNativeZoom: 17,
+    attribution: '<a href="https://s2maps.eu" target="_blank" rel="noopener">Sentinel-2 cloudless 2023</a> by EOX (contains modified Copernicus Sentinel data 2023)'
+  });
+  let satErrors = 0, satSwitched = false;
+  satBase.on("tileerror", () => {
+    if (satSwitched || ++satErrors < 6) return;
+    satSwitched = true;
+    const on = map.hasLayer(satBase);
+    if (on) map.removeLayer(satBase);
+    satBase = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19, attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics"
+    });
+    if (on) satBase.addTo(map).bringToBack();
+  });
+  let lstTiles = null;
   let tileErrors = 0, switched = false;
   osm.on("tileerror", () => {
     if (switched || ++tileErrors < 6) return;
@@ -242,8 +262,72 @@
   document.querySelector(".mapwrap").appendChild(readout);
 
   function layerStops() { return state.layer === "uv" ? UV_STOPS : TEMP_STOPS; }
-  function layerName() { return { apparent: "Feels like", temp: "Temperature", uv: "UV index" }[state.layer]; }
+  function layerName() { return { apparent: "Feels like", temp: "Temperature", uv: "UV index", lst: "Surface temperature" }[state.layer]; }
   function layerUnit() { return state.layer === "uv" ? "" : "°C"; }
+  const isLst = () => state.layer === "lst";
+
+  /* ---------------- satellite (NASA surface temperature) ---------------- */
+  let lstGrad = null; // { css, colorAt }
+  HM.SAT.legendGradient(10, 60).then((g) => { lstGrad = g; if (isLst()) { drawLegend(); drawCityMarkers(); } }).catch(() => {});
+  function satDate() {
+    return state.sat.period === "summer" ? HM.SAT.summerDate() : state.sat.dates[state.sat.kind] || null;
+  }
+  async function ensureSatDate() {
+    if (state.sat.period === "summer" || state.sat.dates[state.sat.kind]) return satDate();
+    const c = state.grid ? state.grid.city : { lat: 22.8, lon: 80.5 };
+    state.sat.dates[state.sat.kind] = await HM.SAT.latestDate(state.sat.kind, c.lat, c.lon);
+    return satDate();
+  }
+  function satKey() { return `${state.sat.kind}|${satDate()}`; }
+  function satPeriodText() {
+    const d = satDate();
+    return d ? `${HM.SAT.periodLabel(d)} · ${state.sat.kind === "day" ? "daytime" : "night-time"} pass` : "finding the latest satellite pass…";
+  }
+  function setBasemap(b) {
+    state.basemap = b;
+    if (b === "sat") { if (map.hasLayer(osm)) map.removeLayer(osm); if (!map.hasLayer(satBase)) satBase.addTo(map).bringToBack(); }
+    else { if (map.hasLayer(satBase)) map.removeLayer(satBase); if (!map.hasLayer(osm)) osm.addTo(map).bringToBack(); }
+    document.querySelectorAll("[data-basemap]").forEach((x) => {
+      const on = x.dataset.basemap === b;
+      x.classList.toggle("on", on);
+      x.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  async function updateLstTiles() {
+    if (!isLst()) { if (lstTiles) { map.removeLayer(lstTiles); lstTiles = null; } return; }
+    const date = await ensureSatDate();
+    if (!isLst()) return;
+    const url = HM.SAT.leafletUrl(state.sat.kind, date);
+    if (lstTiles && lstTiles._url === url) { lstTiles.setOpacity(state.sat.opacity); return; }
+    if (lstTiles) map.removeLayer(lstTiles);
+    lstTiles = L.tileLayer(url, {
+      maxNativeZoom: 7, maxZoom: 19, opacity: state.sat.opacity, className: "lst-tiles", crossOrigin: "anonymous",
+      attribution: 'Surface temperature &amp; vegetation: <a href="https://earthdata.nasa.gov/gibs" target="_blank" rel="noopener">NASA GIBS</a> / MODIS'
+    }).addTo(map);
+    drawLegend();
+    loadSatCityVals();
+    if (state.mode === "india") renderIndiaPanel();
+  }
+  async function loadSatCityVals() {
+    const date = await ensureSatDate();
+    const key = satKey();
+    if (state.sat.cityVals[key]) return;
+    state.sat.cityVals[key] = "loading";
+    const vals = await Promise.all(HM.CITIES.map((c) => HM.SAT.lstAt(state.sat.kind, date, c.lat, c.lon).catch(() => null)));
+    state.sat.cityVals[key] = vals;
+    if (isLst() && satKey() === key) { drawCityMarkers(); if (state.mode === "india") renderIndiaPanel(); }
+  }
+  function cityValue(i, layer, h) {
+    if (layer === "lst") {
+      const v = state.sat.cityVals[satKey()];
+      return Array.isArray(v) ? v[i] : null;
+    }
+    return valueAt(state.india && state.india[i], layer, h);
+  }
+  function colorForLayer(v) {
+    if (isLst()) return lstGrad ? lstGrad.colorAt(v) : [150, 150, 150];
+    return colorAt(layerStops(), v);
+  }
 
   /* India overview markers */
   function drawCityMarkers() {
@@ -251,8 +335,8 @@
     if (!state.india) return;
     HM.CITIES.forEach((c, i) => {
       const loc = state.india[i];
-      const v = valueAt(loc, state.layer, state.hour);
-      const col = v == null ? [150, 150, 150] : colorAt(layerStops(), v);
+      const v = cityValue(i, state.layer, state.hour);
+      const col = v == null ? [150, 150, 150] : colorForLayer(v);
       const size = state.mode === "india" ? 34 : 26;
       const icon = L.divIcon({
         className: "",
@@ -261,7 +345,8 @@
       });
       const m = L.marker([c.lat, c.lon], { icon, keyboard: true, title: c.name, riseOnHover: true });
       const app = valueAt(loc, "apparent", state.hour), tmp = valueAt(loc, "temp", state.hour), uv = valueAt(loc, "uv", state.hour);
-      m.bindTooltip(`<strong>${esc(c.name)}</strong><br>${fmt(tmp)}°C · feels ${fmt(app)}°C · UV ${fmt(uv, 1)}<br><em>${heatLevel(app).label}</em>`, { direction: "top", offset: [0, -size / 2] });
+      const satLine = isLst() ? `<br>Surface (satellite): ${v == null ? "no data / clouds" : fmt(v, 1) + "°C"}` : "";
+      m.bindTooltip(`<strong>${esc(c.name)}</strong><br>${fmt(tmp)}°C · feels ${fmt(app)}°C · UV ${fmt(uv, 1)}<br><em>${heatLevel(app).label}</em>${satLine}`, { direction: "top", offset: [0, -size / 2] });
       m.on("click", () => goCity(c));
       m.addTo(cityLayer);
     });
@@ -370,7 +455,7 @@
   let lastStats = null;
 
   function drawOverlay() {
-    if (state.mode !== "city" || !state.grid) {
+    if (state.mode !== "city" || !state.grid || isLst()) {
       if (overlay) { map.removeLayer(overlay); overlay = null; }
       return;
     }
@@ -421,7 +506,24 @@
     return v == null ? null : v - coolingAtLatLng(ll.lat, ll.lng);
   }
 
+  let readoutToken = 0;
+  function placeReadout(e, text) {
+    readout.textContent = text;
+    readout.style.left = e.containerPoint.x + 14 + "px";
+    readout.style.top = e.containerPoint.y + 12 + "px";
+    readout.style.display = "block";
+  }
   map.on("mousemove", (e) => {
+    if (isLst()) {
+      const date = satDate();
+      if (!date) return;
+      const tok = ++readoutToken;
+      HM.SAT.lstAt(state.sat.kind, date, e.latlng.lat, e.latlng.lng).then((v) => {
+        if (tok !== readoutToken) return;
+        placeReadout(e, v == null ? "No satellite reading here (cloud or water)" : `Surface ${fmt(v, 1)}°C · 1 km satellite pixel${state.mode === "city" ? " · click for details" : ""}`);
+      }).catch(() => {});
+      return;
+    }
     if (state.mode !== "city" || !state.grid) { readout.style.display = "none"; return; }
     const v = gridValueAtLatLng(e.latlng);
     if (v == null) { readout.style.display = "none"; return; }
@@ -495,7 +597,7 @@
   }
   function plantAtHotspots() {
     if (!state.grid) return;
-    if (state.layer === "uv") setLayer("apparent");
+    if (state.layer === "uv" || isLst()) setLayer("apparent");
     const narrow = window.innerWidth <= 900;
     if (narrow) document.querySelector(".mapwrap").scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth" });
     const wait = narrow ? 600 : 0;
@@ -549,6 +651,7 @@
 
   /* ---------------- legend ---------------- */
   function drawLegend() {
+    if (isLst()) return drawLstLegend();
     const stops = layerStops();
     const s0 = stops[0][0], s1 = stops[stops.length - 1][0];
     const grad = stops.map(([s, c]) => `${c} ${(((s - s0) / (s1 - s0)) * 100).toFixed(1)}%`).join(",");
@@ -582,6 +685,27 @@
       <div class="zones">${zones}</div>${extra}`;
     const chk = document.getElementById("contrastChk");
     if (chk) chk.onchange = () => { state.contrast = chk.checked; drawOverlay(); drawLegend(); };
+  }
+
+  function drawLstLegend() {
+    const css = lstGrad ? lstGrad.css : "linear-gradient(90deg,#999,#ccc)";
+    const b = (attr, val, label) => `<button type="button" data-${attr}="${val}" class="${state.sat[attr] === val ? "on" : ""}">${label}</button>`;
+    els.legend.innerHTML = `<h4>Surface temperature (°C)</h4>
+      <div class="bar" style="background:${css}"></div>
+      <div class="ticks"><span>10</span><span>35</span><span>60</span></div>
+      <div class="mini-seg">${b("period", "latest", "Latest")}${b("period", "summer", "Last summer")}</div>
+      <div class="mini-seg">${b("kind", "day", "☀ Day")}${b("kind", "night", "☾ Night")}</div>
+      <label class="chk op">Heat layer <input type="range" id="lstOpacity" min="0" max="100" value="${Math.round(state.sat.opacity * 100)}" aria-label="Surface heat layer opacity"></label>
+      <div class="note" style="margin-top:4px">${esc(satPeriodText())}. NASA MODIS, ~1 km pixels. Ground and rooftops, not air. Gaps are clouds or water.</div>`;
+    els.legend.querySelectorAll("[data-period]").forEach((x) => x.onclick = () => { state.sat.period = x.dataset.period; satChanged(); });
+    els.legend.querySelectorAll("[data-kind]").forEach((x) => x.onclick = () => { state.sat.kind = x.dataset.kind; satChanged(); });
+    const op = document.getElementById("lstOpacity");
+    op.oninput = () => { state.sat.opacity = op.value / 100; if (lstTiles) lstTiles.setOpacity(state.sat.opacity); };
+  }
+  function satChanged() {
+    drawLegend();
+    updateLstTiles();
+    renderPanel();
   }
 
   /* ---------------- sky theme for the side panel ---------------- */
@@ -667,7 +791,7 @@
     if (!state.india) return;
     const h = state.hour;
     const t = timeAt(state.india[0], h);
-    const rows = HM.CITIES.map((c, i) => ({ c, v: valueAt(state.india[i], state.layer, h), uv: valueAt(state.india[i], "uv", h), app: valueAt(state.india[i], "apparent", h) }))
+    const rows = HM.CITIES.map((c, i) => ({ c, v: cityValue(i, state.layer, h), uv: valueAt(state.india[i], "uv", h), app: valueAt(state.india[i], "apparent", h) }))
       .sort((a, b) => (b.v == null ? -99 : b.v) - (a.v == null ? -99 : a.v));
     const apps = rows.map((r) => r.app).filter((x) => x != null).sort((a, b) => a - b);
     applySky(skyKey(apps[Math.floor(apps.length / 2)], isDayAt(state.india[0], h)));
@@ -677,16 +801,16 @@
       `<span class="pill"><i style="background:${l.color}"></i>${counts[l.id]} ${l.label.toLowerCase()}</span>`).join("");
 
     els.panel.innerHTML = `
-      ${hero(`${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}`, "All of India", `${HM.CITIES.length} cities · sorted by ${layerName().toLowerCase()} · tap a city to see its heat map`)}
+      ${hero(isLst() ? `Satellite · ${esc(satPeriodText())}` : `${h === 0 ? "Right now" : "Forecast"} · ${esc(hourText(t))}`, "All of India", `${HM.CITIES.length} cities · sorted by ${layerName().toLowerCase()}${isLst() ? " at the city centre" : ""} · tap a city to see its heat map`)}
       <section class="card">
         <div class="pills">${summary}</div>
         <ul class="rank" id="rankList">
           ${rows.map((r) => {
-            const col = r.v == null ? [160, 160, 160] : colorAt(layerStops(), r.v);
+            const col = r.v == null ? [160, 160, 160] : colorForLayer(r.v);
             return `<li data-city="${esc(r.c.name)}" tabindex="0" role="button" aria-label="Open ${esc(r.c.name)}">
               <span class="dot" style="background:${rgbStr(col)}"></span>
               <span class="nm">${esc(r.c.name)} <span class="note">${esc(r.c.state)}</span></span>
-              <span class="val">${fmt(r.v, state.layer === "uv" ? 1 : 0)}${layerUnit()}</span>
+              <span class="val">${r.v == null && isLst() ? '<span class="note">clouds</span>' : fmt(r.v, state.layer === "uv" ? 1 : 0) + layerUnit()}</span>
               <span class="uvv">${state.layer === "uv" ? fmt(r.app, 0) + "°C" : "UV " + fmt(r.uv, 0)}</span>
             </li>`;
           }).join("")}
@@ -766,6 +890,7 @@
           <div class="stat"><div class="k">UV index</div><div class="v">${fmt(uv, 1)}</div><span class="uv-chip" style="background:${uvl.color};color:${uvl.ink}">${esc(uvl.label)}</span></div>
           <div class="stat"><div class="k">Today's peak UV</div><div class="v">${fmt(uvPeak, 1)}</div><span class="uv-chip" style="background:${uvlPeak.color};color:${uvlPeak.ink}">${esc(uvlPeak.label)}</span></div>
           <div class="stat" title="Wet-bulb temperature combines heat and humidity. Above about 31°C, even fit people struggle to cool down during activity."><div class="k">Wet-bulb (approx.)</div><div class="v">${fmt(tw, 1)}<small>°C</small></div></div>
+          <div class="stat wide" title="Land surface temperature measured by NASA's MODIS satellite for this 1 km spot: ground and rooftops, which get much hotter than the air in sunshine."><div class="k">🛰 Ground surface (satellite)</div><div class="v" id="satStat">…</div><div class="note" id="satStatNote"></div></div>
         </div>
         ${!day && h === 0 ? `<p class="note" style="margin:-4px 0 10px">The sun is down, so the UV index is 0 now. Sun-safety advice below is for today's peak.</p>` : ""}
         ${imdBlock(loc, f.terrain)}
@@ -777,6 +902,8 @@
       </section>
 
       ${historyCard()}
+
+      ${state.mode === "city" && state.grid ? satelliteCard() : ""}
 
       <section class="card">
         <h3 class="sec">What to do in this zone</h3>
@@ -803,6 +930,100 @@
     drawHourChart(loc);
     drawHistoryChart();
     bindPanel();
+    fillSatStat(f);
+  }
+  async function fillSatStat(f) {
+    const el = document.getElementById("satStat"), note = document.getElementById("satStatNote");
+    if (!el) return;
+    try {
+      const date = await ensureSatDate();
+      const v = await HM.SAT.lstAt(state.sat.kind, date, f.lat, f.lon);
+      if (!document.body.contains(el)) return;
+      el.innerHTML = v == null ? '<small>no reading (clouds or water)</small>' : `${fmt(v, 1)}<small>°C</small>`;
+      note.textContent = `${HM.SAT.periodLabel(date)}, ${state.sat.kind === "day" ? "daytime" : "night-time"} average`;
+    } catch (_) { el.innerHTML = "<small>unavailable</small>"; }
+  }
+
+  /* ---------------- "What the satellite sees" ---------------- */
+  const SAT_RADIUS_KM = 15;
+  function satelliteCard() {
+    const g = state.grid;
+    const name = g.city.name === "Your area" ? "your area" : g.city.name;
+    const date = satDate();
+    const key = `${g.city.lat.toFixed(3)},${g.city.lon.toFixed(3)}|${satKey()}`;
+    const rec = date ? state.sat.analyses[key] : null;
+    const head = `<h3 class="sec">🛰 What the satellite sees</h3>
+      <div class="mini-seg inline">
+        <button type="button" data-satperiod="latest" class="${state.sat.period === "latest" ? "on" : ""}">Latest</button>
+        <button type="button" data-satperiod="summer" class="${state.sat.period === "summer" ? "on" : ""}">Last summer</button>
+        <button type="button" data-satkind="day" class="${state.sat.kind === "day" ? "on" : ""}">☀ Day</button>
+        <button type="button" data-satkind="night" class="${state.sat.kind === "night" ? "on" : ""}">☾ Night</button>
+      </div>`;
+    if (!date || !rec || rec === "loading") {
+      setTimeout(() => runSatAnalysis(key), 0);
+      return `<section class="card satcard">${head}<p class="note">Reading NASA satellite data for ${esc(name)}…</p><div class="skeleton" style="height:90px"></div></section>`;
+    }
+    if (rec.error) return `<section class="card satcard">${head}<p class="note">Couldn't read the satellite data: ${esc(rec.error)}</p><button class="btn small" type="button" id="satRetry">Retry</button></section>`;
+    const A = rec;
+    if (!A.cells) return `<section class="card satcard">${head}<p class="note">Clouds covered ${esc(name)} for this whole period (${esc(satPeriodText())}). Try “Last summer” or the other pass.</p></section>`;
+    const cover = Math.round((A.cells / Math.max(1, A.landTotal)) * 100);
+    let compare = "";
+    if (A.green && A.grey) {
+      const diff = A.grey.mean - A.green.mean;
+      const vals = [A.green.mean, A.grey.mean].concat(A.water ? [A.water.mean] : []);
+      const lo = Math.min(...vals) - 1, hi = Math.max(...vals) + 0.5;
+      const w = (v) => Math.max(8, Math.round(((v - lo) / (hi - lo)) * 100));
+      const bar = (label, icon, v, sub, cls) => `<div class="cmp-row"><span class="cmp-label">${icon} ${label} <span class="note">${sub}</span></span><span class="cmp-bar ${cls}" style="width:${w(v)}%"></span><b>${fmt(v, 1)}°C</b></div>`;
+      compare = `<p class="hist-lead">${diff >= 0.3
+        ? `The greenest third of this area averaged <b>${fmt(diff, 1)}°C cooler</b> at ground level than the least green third.`
+        : diff <= -0.3
+          ? `This time the greenest third was <b>${fmt(-diff, 1)}°C warmer</b> than the least green third. That can happen at night, after rain, or where the least green land is wet or open water.`
+          : `The greenest and least green parts of this area were about the same temperature this time.`}</p>
+        <div class="cmp">${bar("Greenest third", "🌳", A.green.mean, `greenness ${fmt(A.green.ndvi, 2)} · ${A.green.n} km²`, "g")}${bar("Least green third", "🏙️", A.grey.mean, `greenness ${fmt(A.grey.ndvi, 2)} · ${A.grey.n} km²`, "b")}${A.water ? bar("Water and shoreline", "💧", A.water.mean, `${A.water.n} km²`, "w") : ""}</div>`;
+    } else {
+      compare = `<p class="note">Not enough clear land pixels to compare greener and less green areas this time.</p>`;
+    }
+    const spot = (lbl, c, cls) => `<li class="${cls}"><span>${lbl} <span class="note">${offsetText(c.lat, c.lon, g.city)}</span></span><b>${fmt(c.v, 1)}°C</b><button type="button" class="btn small" data-spot="${c.lat},${c.lon},${cls}">Show</button></li>`;
+    return `<section class="card satcard">${head}
+      <p class="note" style="margin-top:0">Within ${SAT_RADIUS_KM} km of the centre · ${esc(satPeriodText())} · ${cover}% of land clear of clouds</p>
+      ${compare}
+      <ul class="spots">${spot("Coolest 1 km", A.coolest, "cool")}${spot("Hottest 1 km", A.hottest, "hot")}</ul>
+      <button type="button" class="btn primary" id="showSat">🛰 Show surface heat on the satellite map</button>
+      <p class="note">Greenness is NASA's vegetation index (NDVI, 250 m; higher means more plant cover). Each 1 km cell is ranked by greenness and the top and bottom thirds are compared. Satellites measure ground and rooftop temperature, which in sunshine runs far hotter than the air. Pixels are 1 km, so small parks blur into their surroundings. Before the monsoon, dry bare farmland can be hotter than the city itself.</p>
+    </section>`;
+  }
+  async function runSatAnalysis(key) {
+    if (state.sat.analyses[key] && state.sat.analyses[key] !== "loading-wait") {
+      if (state.sat.analyses[key] === "loading") return;
+    }
+    const g = state.grid;
+    if (!g) return;
+    const date = await ensureSatDate();
+    const realKey = `${g.city.lat.toFixed(3)},${g.city.lon.toFixed(3)}|${state.sat.kind}|${date}`;
+    if (state.sat.analyses[realKey]) { if (realKey !== key) renderPointPanel(); return; }
+    state.sat.analyses[realKey] = "loading";
+    try {
+      state.sat.analyses[realKey] = await HM.SAT.analyse(state.sat.kind, date, g.city.lat, g.city.lon, SAT_RADIUS_KM);
+    } catch (e) {
+      state.sat.analyses[realKey] = { error: e.message || "network error" };
+    }
+    if (state.mode === "city" && state.grid === g) renderPointPanel();
+  }
+  function showSatView(lat, lon, zoom, label) {
+    setBasemap("sat");
+    if (!isLst()) setLayer("lst");
+    if (lat != null) {
+      state.sat.opacity = Math.min(state.sat.opacity, 0.5);
+      if (lstTiles) lstTiles.setOpacity(state.sat.opacity);
+      drawLegend();
+      map.flyTo([lat, lon], zoom, { duration: 0.8 });
+      if (clickMarker) map.removeLayer(clickMarker);
+      clickMarker = L.marker([lat, lon], { icon: L.divIcon({ className: "", html: '<div class="click-dot"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }), interactive: false }).addTo(map);
+      if (label) clickMarker.bindTooltip(label, { permanent: true, direction: "top", offset: [0, -8] }).openTooltip();
+    } else if (state.grid) {
+      map.flyToBounds(state.grid.bounds, { duration: 0.8 });
+    }
+    if (window.innerWidth <= 900) document.querySelector(".mapwrap").scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth" });
   }
 
   function drawHourChart(loc) {
@@ -1036,7 +1257,19 @@
     if (retry) retry.onclick = () => { const p = historyPlace(); delete state.history[p.key]; renderPointPanel(); };
     const ph = document.getElementById("plantHot");
     if (ph) ph.onclick = plantAtHotspots;
+    els.panel.querySelectorAll("[data-satperiod]").forEach((b) => b.onclick = () => { state.sat.period = b.dataset.satperiod; satChanged(); });
+    els.panel.querySelectorAll("[data-satkind]").forEach((b) => b.onclick = () => { state.sat.kind = b.dataset.satkind; satChanged(); });
+    const ss = document.getElementById("showSat");
+    if (ss) ss.onclick = () => showSatView(null);
+    const sr = document.getElementById("satRetry");
+    if (sr) sr.onclick = () => { state.sat.analyses = {}; renderPointPanel(); };
+    els.panel.querySelectorAll("[data-spot]").forEach((b) => b.onclick = () => {
+      const [lat, lon, cls] = b.dataset.spot.split(",");
+      const li = b.closest("li");
+      showSatView(+lat, +lon, 13, `${cls === "cool" ? "Coolest" : "Hottest"} 1 km: ${li.querySelector("b").textContent}`);
+    });
     els.panel.querySelectorAll("[data-tool-btn]").forEach((b) => b.addEventListener("click", () => {
+      if (isLst()) setLayer("apparent");
       if (state.tool !== b.dataset.toolBtn) setTool(b.dataset.toolBtn);
       if (window.innerWidth <= 900) document.querySelector(".mapwrap").scrollIntoView({ behavior: "smooth" });
     }));
@@ -1049,6 +1282,7 @@
     return `<section class="card"><details class="acc flat"><summary>About this data</summary>
       <p class="note">Live readings and forecasts come from the free Open-Meteo API, which blends national weather-service models (resolution about 2–11 km). The map shows how heat varies across a city at that scale. Street-level differences, such as a concrete market versus a park, need satellite surface-temperature data and are not shown.
       Heat history uses NASA POWER daily maximum temperatures since 1990 (satellite and model data, roughly 50 km grid).
+      The satellite view shows NASA MODIS land surface temperature (8-day averages, ~1 km) and vegetation greenness (NDVI, ~250 m) from NASA GIBS, over Sentinel-2 cloudless imagery by EOX.
       Zones use the “feels like” temperature, which combines air temperature, humidity and wind, with the standard heat-index bands. UV categories follow the WHO Global Solar UV Index. Precautions are adapted from India's NDMA heatwave guidance.</p>
       <p class="note"><b>Tree simulator:</b> each tree patch stands for a small urban forest. It cools by up to ${HM.SIM.tree.peak}°C at its centre (urban forests average about 1.6°C cooler than built-up surroundings), fading to almost nothing by about 1.25 km away, the distance park cooling has been measured to reach. Overlapping patches add up with diminishing returns, capped at ${HM.SIM.tree.cap}°C, the peak daytime cooling trees achieve in hot, dry climates. At night the effect is cut to ${Math.round(HM.SIM.tree.nightFactor * 100)}%. Cool roofs lower indoor temperatures by about 2–5°C but barely change outdoor air, so they don't alter the map. These are estimates for exploring ideas, not predictions for a specific site.</p>
       <p class="note">Data refreshes every 15 minutes. This site does not issue official warnings.</p>
@@ -1070,7 +1304,7 @@
     status("Loading live data for " + HM.CITIES.length + " cities…");
     try {
       state.india = await fetchForecast(HM.CITIES);
-      els.timebar.hidden = false;
+      els.timebar.hidden = isLst();
       drawCityMarkers();
       if (state.mode === "india") renderIndiaPanel();
       if (state.mode !== "city" || state.grid) status("Live data loaded", "ok");
@@ -1102,6 +1336,7 @@
     map.flyTo([22.8, 80.5], 5, { duration: 0.8 });
     if (push) setHash("");
     if (state.india) { drawCityMarkers(); renderIndiaPanel(); } else loadIndia();
+    if (isLst()) loadSatCityVals();
   }
 
   async function goCity(city, push = true) {
@@ -1126,8 +1361,8 @@
       if (id !== state.reqId) return;
       g.locs = locs;
       state.grid = g;
-      els.timebar.hidden = false;
-      els.simbar.hidden = false;
+      els.timebar.hidden = isLst();
+      els.simbar.hidden = isLst();
       const centre = locs[Math.floor((GRID_N * GRID_N) / 2)];
       state.focus = { loc: centre, title: city.name, subtitle: `${city.state} · city centre · tap anywhere on the map to check another spot`, terrain: city.terrain, lat: city.lat, lon: city.lon };
       drawOverlay();
@@ -1180,9 +1415,21 @@
     renderPanel();
   }
 
+  let satAutoBasemap = false;
   function setLayer(layer) {
+    const wasLst = isLst();
     state.layer = layer;
-    document.querySelectorAll(".seg button").forEach((b) => {
+    if (isLst()) {
+      if (!satAutoBasemap) { satAutoBasemap = true; setBasemap("sat"); }
+      if (state.tool) setTool(state.tool);
+      if (state.playing) els.play.click();
+    }
+    els.timebar.hidden = isLst() || !state.india;
+    els.simbar.hidden = isLst() || state.mode !== "city" || !state.grid;
+    if (isLst()) els.simMeter.hidden = true; else if (wasLst) updateSimMeter();
+    featureLayer.getPane && (isLst() ? map.removeLayer(featureLayer) : (!map.hasLayer(featureLayer) && featureLayer.addTo(map)));
+    updateLstTiles();
+    document.querySelectorAll(".seg button[data-layer]").forEach((b) => {
       const on = b.dataset.layer === layer;
       b.classList.toggle("on", on);
       b.setAttribute("aria-selected", on ? "true" : "false");
@@ -1216,7 +1463,8 @@
     const c = HM.CITIES.find((x) => x.name === els.city.value);
     c ? goCity(c) : goIndia();
   });
-  document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => setLayer(b.dataset.layer)));
+  document.querySelectorAll(".seg button[data-layer]").forEach((b) => b.addEventListener("click", () => setLayer(b.dataset.layer)));
+  document.querySelectorAll("[data-basemap]").forEach((b) => b.addEventListener("click", () => setBasemap(b.dataset.basemap)));
   els.simbar.querySelectorAll("[data-tool]").forEach((b) => b.addEventListener("click", () => setTool(b.dataset.tool)));
   document.getElementById("simReset").addEventListener("click", resetFeatures);
   els.slider.addEventListener("input", () => setHour(+els.slider.value));
