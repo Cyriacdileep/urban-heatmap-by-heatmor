@@ -43,6 +43,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .layout { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 400px; min-height: 0; }
 .mapwrap { position: relative; min-height: 420px; }
 #map { position: absolute; inset: 0; background: #e9e6df; }
+/* mute the colourful OSM base map so heat colours read clearly */
+#map .leaflet-tile-pane { filter: grayscale(0.85) contrast(0.9) brightness(1.04); }
 .panel { background: var(--card); border-left: 1px solid var(--line); overflow-y: auto; max-height: calc(100vh - 110px); }
 #panelBody { padding: 16px 18px 28px; }
 

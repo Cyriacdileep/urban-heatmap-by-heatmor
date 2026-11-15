@@ -21,7 +21,7 @@ A live heat-stress and UV index map for 38 Indian cities, with safety precaution
 | Temperature, feels-like, humidity, UV index (live + hourly forecast) | [Open-Meteo](https://open-meteo.com/) forecast API (free, no key, CC BY 4.0) |
 | Heatwave thresholds | India Meteorological Department criteria |
 | Precautions | NDMA heat-wave do's & don'ts; WHO Global Solar UV Index |
-| Base map | © OpenStreetMap contributors, © CARTO |
+| Base map | © OpenStreetMap contributors (Esri light-grey basemap as automatic fallback); no API key needed |
 
 Data refreshes every 15 minutes. Model resolution is roughly 2–11 km, so the map shows heat variation at neighbourhood-to-district scale. It can't tell one street from the next. That would need satellite land-surface temperature (Landsat / MODIS).
 

@@ -184,16 +184,27 @@
   /* ---------------- map ---------------- */
   const map = L.map("map", { zoomControl: true, minZoom: 4, maxZoom: 14, worldCopyJump: false })
     .setView([22.8, 80.5], 5);
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
-    subdomains: "abcd", maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+  /* Base map: OpenStreetMap tiles (no API key). The tile pane is muted with CSS so
+   * the heat colours stand out. If OSM tiles keep failing, switch to Esri's
+   * keyless light-grey basemap. */
+  const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map);
-  const labelsPane = map.createPane("labels");
-  labelsPane.style.zIndex = 450;
-  labelsPane.style.pointerEvents = "none";
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png", {
-    subdomains: "abcd", maxZoom: 19, pane: "labels"
-  }).addTo(map);
+  let tileErrors = 0, switched = false;
+  osm.on("tileerror", () => {
+    if (switched || ++tileErrors < 6) return;
+    switched = true;
+    map.removeLayer(osm);
+    const esri = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+    L.tileLayer(esri + "World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 16, attribution: "Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors"
+    }).addTo(map);
+    const labelsPane = map.createPane("labels");
+    labelsPane.style.zIndex = 450;
+    labelsPane.style.pointerEvents = "none";
+    L.tileLayer(esri + "World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}", { maxZoom: 16, pane: "labels" }).addTo(map);
+  });
 
   const cityLayer = L.layerGroup().addTo(map);
   let overlay = null;
